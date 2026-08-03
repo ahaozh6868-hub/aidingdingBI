@@ -1,0 +1,622 @@
+#!/usr/bin/env python3
+"""
+PMS → AI钉钉表格 增量同步脚本 v3
+支持：token参数化、增量同步（昨天数据）、去重检查、详细日志
+
+用法:
+  python3 pms_sync.py --token "Bearer xxx"           # 增量同步昨天数据
+  python3 pms_sync.py --token "Bearer xxx" --full     # 全量同步
+  python3 pms_sync.py --token "Bearer xxx" --dry-run   # 只检查不写入
+"""
+import argparse, json, subprocess, urllib.request, urllib.error, datetime, sys, os, ssl, certifi
+import logging, logging.handlers, traceback, time, io
+
+# ====== 项目根目录（日志/脚本所在目录） ======
+def _get_app_dir():
+    """获取应用根目录：exe 所在目录（PyInstaller）或脚本目录"""
+    if getattr(sys, 'frozen', False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
+
+SCRIPT_DIR = _get_app_dir()
+
+# ====== 日志系统 ======
+class DualLogger:
+    """双通道日志：控制台 INFO 级别 + 文件 DEBUG 级别，带时间戳文件名"""
+    def __init__(self):
+        self.start_time = time.time()
+        self.error_count = 0
+        self.warn_count = 0
+        self.stage_start = 0
+
+        # 确保 logs 目录存在
+        log_dir = os.path.join(SCRIPT_DIR, "logs")
+        os.makedirs(log_dir, exist_ok=True)
+
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.log_file = os.path.join(log_dir, f"sync_{timestamp}.log")
+
+        self.logger = logging.getLogger("pms_sync")
+        self.logger.setLevel(logging.DEBUG)
+        self.logger.handlers.clear()
+
+        # 文件 handler：DEBUG 级别，记录全部细节
+        fh = logging.FileHandler(self.log_file, encoding="utf-8")
+        fh.setLevel(logging.DEBUG)
+        fh.setFormatter(logging.Formatter(
+            "%(asctime)s.%(msecs)03d [%(levelname)-5s] %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S"
+        ))
+        self.logger.addHandler(fh)
+
+        # 控制台 handler：INFO 级别，简洁输出
+        ch = logging.StreamHandler(sys.stdout)
+        ch.setLevel(logging.INFO)
+        ch.setFormatter(logging.Formatter("%(message)s"))
+        self.logger.addHandler(ch)
+
+    def debug(self, msg, *args): self.logger.debug(msg, *args)
+    def info(self, msg, *args): self.logger.info(msg, *args)
+    def warning(self, msg, *args):
+        self.warn_count += 1
+        self.logger.warning(msg, *args)
+    def error(self, msg, *args):
+        self.error_count += 1
+        self.logger.error(msg, *args)
+
+    def exception(self, msg, *args):
+        """记录异常 + 完整堆栈"""
+        self.error_count += 1
+        buf = io.StringIO()
+        traceback.print_exc(file=buf)
+        self.logger.error(f"{msg}\n{buf.getvalue().rstrip()}", *args)
+
+    def stage_begin(self, name):
+        self.stage_start = time.time()
+        self.info(f"  ── [{name}] 开始...")
+
+    def stage_end(self, name, extra=""):
+        elapsed = time.time() - self.stage_start
+        tail = f" | {extra}" if extra else ""
+        self.info(f"  ── [{name}] 完成 (耗时 {elapsed:.1f}s){tail}")
+
+    def lifecycle(self, msg):
+        self.info(f"◆ {msg}")
+        self.debug(f"[LIFECYCLE] {msg}")
+
+    def hr(self, char="─", width=60):
+        self.info(char * width)
+
+    def summary(self, extra_errors=0):
+        total_elapsed = time.time() - self.start_time
+        total_err = self.error_count + extra_errors
+        status = "❌ 失败" if total_err > 0 else "✅ 成功"
+        self.hr("=")
+        self.info(f"  执行结果: {status}")
+        self.info(f"  总耗时: {total_elapsed:.1f}s")
+        self.info(f"  警告: {self.warn_count}  错误: {total_err}")
+        self.info(f"  日志文件: {self.log_file}")
+        self.hr("=")
+        return total_err
+
+# 全局日志实例
+log = DualLogger()
+
+# ====== 配置 ======
+PMS_BASE = "https://pms.cosmos-ag.com"
+BASE_ID_PMS = 152
+
+AI_BASE_ID = "vNG4YZ7Jnlp30gY2HNoGqLr9W2LD0oRE"
+AI_TABLES = {
+    "order_main": "89RjlI0",
+    "order_detail": "2Em2ubU",
+    "material": "QJwb6MT",
+    "warehouse": "sTwFnIX",
+    "inventory": "wOSrNZM",
+}
+
+# Field mappings (same as v1)
+MATERIAL_FIELDS = {
+    "name": "8rcs8uaxpcaxnoidgth0o", "num": "i8968bt2xp37jf6ks263a",
+    "variety": "1i0b0mkfxmk62w2ow59jp", "unit": "l95pbs3q856hpmm9265xe",
+    "saleUnit": "5b8dexvv0qckdaxd0ys9g", "grade": "pukwhbfvmewntnifkdkv2",
+    "netWeight": "srrx6u6e32zrex885ez9v", "matGroup": "rrmnapbokbf9duhtz5a5u",
+    "status": "au60oofzejjdnfldp2i43",
+}
+WAREHOUSE_FIELDS = {
+    "code": "uof2j4mvfzohv5ohymore", "name": "jotuo3h0m0mv1rh75bqip",
+    "type": "9xqqm63t147hnyyudg6v1", "matType": "nb8naf0ycz7t3cvy9o6ji",
+}
+ORDER_FIELDS = {
+    "orderId": "grsx5v1hsm0jqrio1n0b9", "orderNumber": "ns6pnsovm5h06ii5ex9i2",
+    "customer": "i2ksuztm4hb0go01qkwo8", "customerNum": "nmd2f7m2eksio1bb9eicn",
+    "purpose": "qnjh1ifgavn5frtq2ubnp", "planDate": "ha3c18bt380ymx2wq6kti",
+    "latestDate": "3h0kntat8p9nf0bwe97gj", "takeStatus": "7oi6wfjb87h78uoy8mi1s",
+    "collectStatus": "alzahmywi33zxyi2dbi9t", "status": "hdoqicwplrv8ffvminwcw",
+    "cancelReason": "8h8s59hdgyzb2ucy90djs", "remark": "mg2x9fsiwvstxub09xjal",
+    "totalPlan": "1r0i1gv8dhnht7i5w3kg2", "totalDelivered": "18l9bsc6m7iexh0gldvfz",
+    "totalTake": "1v5ptqfixasoapl4u5kyz", "orderPrice": "mgo2qeiq0qed3c2et093c",
+    "overOrderPrice": "x28a08jbo3o4ts7nzctv8", "collectAmount": "qcbtn6u0qtr4d1d5lmhi6",
+    "detailCount": "jvjcza9igs695avbir9dn",
+}
+DETAIL_FIELDS = {
+    "orderNumber": "ts71955hgzohfxehzzwaq", "customer": "gxxs7278qy3ek1fnas5mh",
+    "detailId": "61udcyteq9mdib9dyak5p", "matNum": "cgns0m3asacmgafndtb0d",
+    "matName": "8gr6wyhwnlg0fln7oi8m1", "planDelivery": "i4elylq2ajg580ngz8nqu",
+    "actualDelivery": "hjdp49wkboa7cn4mmhmtz", "unit": "qnnag4icqh6f5cbu4guyx",
+    "unitPrice": "k6wyodstrzsizywdtwbdb", "orderPrice": "uotabj0yyvm7yjmsip4ek",
+    "overAmount": "np52g72dfiryc4n21mq3j", "waitDelivery": "lg4jgpchwivkoszsh96z0",
+    "takeNum": "n3a2bnmo32qm3bmhg1vbj", "takeDamage": "8ehrr8lk81c3bl624ys3n",
+    "lossRemark": "r9sumnhfvlgoz15mxyzoy", "detailRemark": "pb671l4k0cpanlq9mf3ph",
+    "convertPlan": "kl5ea3zx96c6mybjcjipk", "convertActual": "x7l9lx6ngipltngh6yvnx",
+    "convertTake": "v0f5u1eo479oyquee2q9q",
+}
+INVENTORY_FIELDS = {
+    "invId": "vezf294rv2kaaumzvnvrr", "recordNum": "oxh5k1mxdz4ga0lx9tikc",
+    "opTime": "21g6xmhx520a6po5m0pij", "changeType": "083f874128yzur5h41sk3",
+    "warehouseId": "db4vuj6tvh0ykmpallx7p", "warehouseName": "j7djj9d2fqvryudemy66t",
+    "materialId": "q0xe4qewf3o2jfan88cmw", "materialName": "3omwrcf4pqix8biz4kk8e",
+    "materialNum": "vyzik5brmosv3a38zkor8", "auxQty": "z0167r6ysjfhezywlxj96",
+    "basicQty": "2b92hrdyhsf254sihezzr", "basicUnit": "ysbn7uceja2er4d9j45tc",
+    "saleUnit": "wfapol890uu4yev7wfbe8", "qtyDesc": "0y6fsed0e75vm00c3rihe",
+    "orderDetailId": "fyobumg6qllymcn65c4qd", "deliveryDate": "gzshsh7e6me59u9oxhgxg",
+    "remark": "pkvrixpj38tox0qe6rjrm", "status": "1l0n513nq5iyxnsnrwe3v",
+    "seqNum": "hbw80w8k0vkjh34npta6j",
+}
+
+# ====== HTTP 工具 ======
+_SSL_CONTEXT = None
+_DWS_PATH = "dws"  # 默认依赖 PATH, 可用 --dws-path 覆盖
+
+def _find_dws():
+    """查找 dws 可执行文件：指定路径 > 同级目录 dws.exe > PATH"""
+    if _DWS_PATH and os.path.isfile(_DWS_PATH):
+        return _DWS_PATH
+    # exe 同级目录查找 (PyInstaller 打包场景)
+    exe_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
+    for name in ["dws.exe", "dws"]:
+        candidate = os.path.join(exe_dir, name)
+        if os.path.isfile(candidate):
+            return candidate
+    return _DWS_PATH  # 回退到 PATH 查找
+
+def _get_ssl_context():
+    """创建 SSL 上下文，使用 certifi 证书"""
+    global _SSL_CONTEXT
+    if _SSL_CONTEXT is not None:
+        return _SSL_CONTEXT
+    _SSL_CONTEXT = ssl.create_default_context(cafile=certifi.where())
+    return _SSL_CONTEXT
+
+def pms_get(path, params=None):
+    url = PMS_BASE + path
+    if params:
+        url += "?" + "&".join(f"{k}={v}" for k,v in params.items())
+    log.debug(f"GET {url}")
+    req = urllib.request.Request(url, headers={"Authorization": PMS_TOKEN})
+    try:
+        with urllib.request.urlopen(req, timeout=30, context=_get_ssl_context()) as resp:
+            raw = resp.read()
+            log.debug(f"GET {url} → HTTP {resp.status} ({len(raw)} bytes)")
+            return json.loads(raw)
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")[:500] if e.fp else ""
+        log.error(f"GET {url} → HTTP {e.code}: {body}")
+        raise
+    except Exception as e:
+        log.error(f"GET {url} → {type(e).__name__}: {e}")
+        raise
+
+def pms_post(path, body):
+    url = PMS_BASE + path
+    data = json.dumps(body).encode("utf-8")
+    log.debug(f"POST {url} (body:{len(data)} bytes)")
+    req = urllib.request.Request(PMS_BASE + path, data=data,
+        headers={"Authorization": PMS_TOKEN, "Content-Type": "application/json"}, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=30, context=_get_ssl_context()) as resp:
+            raw = resp.read()
+            log.debug(f"POST {url} → HTTP {resp.status} ({len(raw)} bytes)")
+            return json.loads(raw)
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")[:500] if e.fp else ""
+        log.error(f"POST {url} → HTTP {e.code}: {body}")
+        raise
+    except Exception as e:
+        log.error(f"POST {url} → {type(e).__name__}: {e}")
+        raise
+
+def dws_cmd(args):
+    dws_bin = _find_dws()
+    log.debug(f"DWS: {dws_bin} {' '.join(args[:6])}...")
+    try:
+        result = subprocess.run([dws_bin] + args, capture_output=True, text=True, timeout=120)
+    except FileNotFoundError:
+        log.error("未找到 dws CLI，请确保已安装 dingtalk-workspace-cli")
+        log.error("安装方法: npm install -g dingtalk-workspace-cli")
+        log.error("或将 dws.exe 放在 pms_sync.exe 同级目录，或使用 --dws-path 参数指定路径")
+        sys.exit(1)
+    except subprocess.TimeoutExpired:
+        log.error(f"DWS 命令超时 (>120s): {' '.join(args[:6])}")
+        return {"success": False, "error": "timeout"}
+    if result.returncode != 0:
+        log.warning(f"DWS 返回非零: {result.returncode}, stderr={result.stderr[:200]}")
+        return {"success": False, "error": result.stderr[:300]}
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError:
+        log.warning(f"DWS 输出非 JSON: {result.stdout[:200]}")
+        return {"success": False, "error": result.stdout[:300]}
+
+# ====== 去重查询（分页） ======
+def query_existing_ids(table_key, field_id):
+    """查询已有记录，返回 key→recordId 的映射（自动分页）"""
+    table_id = AI_TABLES[table_key]
+    lookup = {}
+    cursor = None
+    page = 0
+    while True:
+        page += 1
+        args = ["aitable","record","query","--base-id",AI_BASE_ID,"--table-id",table_id,"--format","json"]
+        if cursor:
+            args.extend(["--cursor", cursor])
+        resp = dws_cmd(args)
+        if not resp.get("success"):
+            log.warning(f"查询已有记录失败 [{table_key}] p{page}: {resp.get('error','')[:100]}")
+            break
+        data = resp.get("data",{})
+        records = data.get("records",[])
+        for rec in records:
+            cells = rec.get("cells",{})
+            val = cells.get(field_id)
+            if isinstance(val, list) and val:
+                item = val[0]
+                val = item.get("text") or item.get("name") or str(item) if isinstance(item, dict) else str(item)
+            elif isinstance(val, dict):
+                val = val.get("text") or val.get("name") or str(val)
+            if val is not None and str(val).strip():
+                lookup[str(val).strip()] = rec.get("recordId")
+        cursor = data.get("nextCursor")
+        if not cursor:
+            break
+    log.debug(f"query_existing_ids [{table_key}]: {len(lookup)} 条 ({page} 页)")
+    return lookup
+
+# ====== 数据转换 ======
+def parse_num(s):
+    """解析字符串数字（处理千位逗号）"""
+    if s is None: return 0
+    if isinstance(s, (int, float)): return float(s)
+    s = str(s).replace(",", "").split()[0] if str(s).split() else "0"
+    try: return float(s) if s else 0
+    except: return 0
+
+def transform_material(m):
+    units = m.get("unit") or []
+    sale = m.get("saleUint") or {}
+    group = m.get("group") or {}
+    custom = m.get("customAttMap") or {}
+    crop = m.get("cropCategory") or {}
+    return {
+        "name": m.get("materialName") or "", "num": m.get("materialNum") or "",
+        "variety": crop.get("name") or "",
+        "unit": units[0].get("val","") if units and isinstance(units[0],dict) else (str(units[0]) if units else ""),
+        "saleUnit": sale.get("val","") if isinstance(sale,dict) else "",
+        "grade": custom.get("103","") if isinstance(custom,dict) else "",
+        "netWeight": custom.get("107","") if isinstance(custom,dict) else "",
+        "matGroup": group.get("name","") if isinstance(group,dict) else "",
+        "status": "启用" if m.get("status")==1 else "停用",
+    }
+
+def transform_warehouse(w):
+    return {"code": w.get("code") or "", "name": w.get("name") or "",
+            "type": str(w.get("type","")), "matType": str(w.get("materialType",""))}
+
+def transform_order(o):
+    cust = o.get("customerInfo") or {}
+    purpose = o.get("purposeVo") or {}
+    pms_status = o.get("status")
+    take = o.get("takeStatus", 0)
+    # 订单状态
+    if pms_status == -1: order_status = "已取消"
+    elif take == 0: order_status = "未收货"
+    elif take == 10: order_status = "部分收货"
+    elif take == 11: order_status = "已收货"
+    else: order_status = "未收货"
+    # 发货状态（基于实际发货量）
+    td_num = parse_num(o.get("totalDelivered"))
+    tp_num = parse_num(o.get("totalPlanDelivery"))
+    if td_num > 0:
+        take_text = "部分发货" if (tp_num > 0 and td_num < tp_num) else "已发货"
+    else:
+        take_text = "未发货"
+    # 收款状态
+    cs = o.get("collectStatus", 0)
+    collect_text = {0:"未收款",10:"部分收款",11:"已收款"}.get(cs, str(cs))
+    details = o.get("details") or []
+    pd = o.get("planDeliveryDate") or ""
+    if pd and "T" not in pd: pd += "T00:00:00+08:00"
+    ld = o.get("latestDeliveryDate") or ""
+    if ld and "T" not in ld: ld += "T00:00:00+08:00"
+    return {
+        "orderId": o.get("orderId"), "orderNumber": o.get("orderNumber") or "",
+        "customer": cust.get("name") or "", "customerNum": cust.get("number") or "",
+        "purpose": purpose.get("purpose") or "" if isinstance(purpose,dict) else "",
+        "planDate": pd or None, "latestDate": ld or None,
+        "takeStatus": take_text, "collectStatus": collect_text,
+        "status": order_status, "cancelReason": o.get("cancelReason") or "",
+        "remark": o.get("remark") or "", "totalPlan": o.get("totalPlanDelivery") or "",
+        "totalDelivered": td_num, "totalTake": o.get("totalTake") or "",
+        "orderPrice": o.get("orderPrice"), "overOrderPrice": o.get("overOrderPrice"),
+        "collectAmount": o.get("collectAmount"), "detailCount": len(details),
+    }
+
+def transform_detail(o, d):
+    cust = o.get("customerInfo") or {}
+    mat = d.get("materialVo") or {}
+    uv = d.get("unitVo") or {}
+    def conv(c):
+        if not c or not isinstance(c, dict): return ""
+        r = c.get("right"); m = c.get("middle","")
+        return f"{r}{m}" if r is not None else ""
+    return {
+        "orderNumber": o.get("orderNumber") or "", "customer": cust.get("name") or "",
+        "detailId": d.get("id"), "matNum": mat.get("materialNum") or "",
+        "matName": mat.get("materialName") or "",
+        "planDelivery": d.get("planDelivery"), "actualDelivery": d.get("overDelivery"),
+        "unit": uv.get("val") or "" if isinstance(uv,dict) else "",
+        "unitPrice": d.get("unitPrice"), "orderPrice": d.get("orderPrice"),
+        "overAmount": d.get("overOrderPrice"), "waitDelivery": d.get("waitDelivery"),
+        "takeNum": d.get("takeNumber"), "takeDamage": d.get("takeDamage"),
+        "lossRemark": d.get("takeDamageRemark") or None,
+        "detailRemark": d.get("detailRemark") or "",
+        "convertPlan": conv(d.get("convertPlanDelivery")),
+        "convertActual": conv(d.get("convertOverDelivery")),
+        "convertTake": conv(d.get("convertTakeNumber")),
+    }
+
+def transform_inventory(i):
+    CT_MAP = {1:"入仓加",2:"入库增",3:"入库减",4:"移库增",5:"移库减",
+              6:"调整增",7:"调整减",8:"出仓减",9:"出仓减(发货)",
+              10:"移仓减",11:"移仓增",12:"退库增"}
+    ct = i.get("changeType")
+    ot = i.get("operationTime") or ""
+    if ot: ot = ot.replace(" ","T"); ot = ot if ("+" in ot or "Z" in ot) else ot+"+08:00"
+    dd = i.get("orderDeliveryDate") or ""
+    if dd: dd = dd.replace(" ","T"); dd = dd if ("+" in dd or "Z" in dd) else dd+"+08:00"
+    return {
+        "invId": i.get("inventoryId"), "recordNum": i.get("recordNo") or "",
+        "opTime": ot, "changeType": CT_MAP.get(ct, str(ct) if ct else ""),
+        "warehouseId": i.get("warehouseId"), "warehouseName": i.get("warehouseName") or "",
+        "materialId": i.get("materialId"), "materialName": i.get("materialName") or "",
+        "materialNum": i.get("materialNum") or "",
+        "auxQty": i.get("amount"), "basicQty": i.get("basicAmount"),
+        "basicUnit": i.get("unit") or "", "saleUnit": i.get("saleUnit") or "",
+        "qtyDesc": i.get("amountDesc") or "",
+        "orderDetailId": i.get("orderDetailId") if i.get("orderDetailId") and i.get("orderDetailId")>0 else None,
+        "deliveryDate": dd or None, "remark": i.get("remark") or "",
+        "status": i.get("status",0), "seqNum": i.get("id"),
+    }
+
+# ====== 同步逻辑 ======
+def sync_table(table_key, fields, records, key_field, dry_run=False):
+    """同步单表：去重检查 + 新增/更新"""
+    key_fid = fields[key_field]
+    existing = query_existing_ids(table_key, key_fid)
+    to_create, to_update = [], []
+    for item in records:
+        cells = {fid: item[k] for k, fid in fields.items() if item.get(k) is not None}
+        kv = str(item.get(key_field, ""))
+        if kv in existing:
+            to_update.append({"recordId": existing[kv], "cells": cells})
+        else:
+            to_create.append({"cells": cells})
+    result = {"table": table_key, "existing": len(existing), "new": len(to_create), "updated": len(to_update)}
+    if dry_run:
+        result["dry_run"] = True
+        return result
+    # Create
+    for i in range(0, len(to_create), 100):
+        batch = to_create[i:i+100]
+        dws_cmd(["aitable","record","create","--base-id",AI_BASE_ID,"--table-id",AI_TABLES[table_key],
+                 "--records", json.dumps(batch, ensure_ascii=False), "--format","json"])
+    # Update
+    for i in range(0, len(to_update), 100):
+        batch = to_update[i:i+100]
+        dws_cmd(["aitable","record","update","--base-id",AI_BASE_ID,"--table-id",AI_TABLES[table_key],
+                 "--records", json.dumps(batch, ensure_ascii=False), "--format","json"])
+    return result
+
+def main():
+    global PMS_TOKEN, _DWS_PATH
+
+    # ====== PARSE ARGS ======
+    parser = argparse.ArgumentParser(description="PMS → AI表格同步")
+    parser.add_argument("--token", required=True, help="PMS Bearer token")
+    parser.add_argument("--full", action="store_true", help="全量同步（默认增量）")
+    parser.add_argument("--dry-run", action="store_true", help="只检查不写入")
+    parser.add_argument("--dws-path", default=None, help="dws CLI 可执行文件路径（默认从 PATH 查找）")
+    args = parser.parse_args()
+
+    PMS_TOKEN = args.token
+    if not PMS_TOKEN.startswith("Bearer "):
+        PMS_TOKEN = "Bearer " + PMS_TOKEN
+    if args.dws_path:
+        _DWS_PATH = args.dws_path
+
+    yesterday = (datetime.date.today() - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
+    mode = "全量" if args.full else f"增量({yesterday})"
+
+    # ====== 生命周期：启动 ======
+    log.hr("=", 65)
+    log.lifecycle(f"PMS → AI Table 同步启动 | 模式: {mode} | Dry-Run: {args.dry_run}")
+    log.info(f"  时间: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    log.info(f"  程序: {SCRIPT_DIR}")
+    log.info(f"  dws:  {_find_dws()}")
+    log.info(f"  PMS:  {PMS_BASE} (baseId={BASE_ID_PMS})")
+    log.info(f"  AI表: {AI_BASE_ID}")
+    log.hr()
+
+    results = []
+    aborted_stages = []
+
+    # ====== Stage 1: 物料表 ======
+    try:
+        log.stage_begin("物料表")
+        mats = pms_post("/pms/system/kc/material/list", {"current":1,"size":100,"baseId":BASE_ID_PMS}).get("rows",[])
+        log.debug(f"PMS 返回物料: {len(mats)} 条")
+        r = sync_table("material", MATERIAL_FIELDS, [transform_material(m) for m in mats], "num", args.dry_run)
+        log.stage_end("物料表", f"{r['new']}新增/{r['updated']}更新 (已有{r['existing']})")
+        results.append(("物料表", r))
+    except Exception as e:
+        log.exception(f"物料表同步异常")
+        results.append(("物料表", {"error": str(e)}))
+        aborted_stages.append("物料表")
+
+    # ====== Stage 2: 仓库表 ======
+    try:
+        log.stage_begin("仓库表")
+        whs = pms_get("/pms/system/warehouse/list", {"baseId":BASE_ID_PMS}).get("rows",[])
+        log.debug(f"PMS 返回仓库: {len(whs)} 条")
+        r = sync_table("warehouse", WAREHOUSE_FIELDS, [transform_warehouse(w) for w in whs], "code", args.dry_run)
+        log.stage_end("仓库表", f"{r['new']}新增/{r['updated']}更新 (已有{r['existing']})")
+        results.append(("仓库表", r))
+    except Exception as e:
+        log.exception(f"仓库表同步异常")
+        results.append(("仓库表", {"error": str(e)}))
+        aborted_stages.append("仓库表")
+
+    # ====== Stage 3: 订单主表 ======
+    sync_orders = []
+    order_skipped = False
+    try:
+        log.stage_begin("订单主表")
+        orders_resp = pms_post("/pms/kc/order/list", {"current":1,"size":100,"baseId":BASE_ID_PMS})
+        orders = orders_resp.get("rows", [])
+        log.debug(f"PMS 返回订单列表: {len(orders)} 条")
+
+        # 获取完整订单详情
+        full_orders = []
+        fetch_errors = 0
+        for i, o in enumerate(orders):
+            oid = o.get("orderId")
+            if oid:
+                try:
+                    detail = pms_get(f"/pms/kc/order/detail/{oid}")
+                    full_orders.append(detail.get("data", detail))
+                except Exception as e:
+                    fetch_errors += 1
+                    log.warning(f"订单详情获取失败 [{oid}]: {e}")
+            else:
+                full_orders.append(o)
+        if fetch_errors:
+            log.warning(f"订单详情获取: {fetch_errors}/{len(orders)} 失败")
+
+        if not args.full:
+            yesterday_orders = [o for o in full_orders if (o.get("planDeliveryDate") or "") == yesterday]
+            log.info(f"  昨日({yesterday})订单: {len(yesterday_orders)} 条")
+            log.debug(f"昨日的订单ID: {[o.get('orderId') for o in yesterday_orders]}")
+
+            existing_orders = query_existing_ids("order_main", ORDER_FIELDS["orderId"])
+            already_synced = sum(1 for o in yesterday_orders if str(o.get("orderId")) in existing_orders)
+            if already_synced == len(yesterday_orders) and len(yesterday_orders) > 0:
+                log.warning(f"  ⚠ 昨日 {len(yesterday_orders)} 条订单已全部同步过，跳过")
+                results.append(("订单主表", {"skipped": True, "reason": "已同步", "existing": already_synced}))
+                results.append(("订单明细", {"skipped": True, "reason": "已同步"}))
+                order_skipped = True
+            else:
+                sync_orders = yesterday_orders
+        else:
+            sync_orders = full_orders
+
+        if not order_skipped and sync_orders:
+            r = sync_table("order_main", ORDER_FIELDS, [transform_order(o) for o in sync_orders], "orderId", args.dry_run)
+            log.stage_end("订单主表", f"{r['new']}新增/{r['updated']}更新 (已有{r['existing']})")
+            results.append(("订单主表", r))
+        elif not order_skipped:
+            log.info("  订单主表: 无待同步订单")
+            results.append(("订单主表", {"skipped": True, "reason": "无数据"}))
+    except Exception as e:
+        log.exception(f"订单主表同步异常")
+        results.append(("订单主表", {"error": str(e)}))
+        aborted_stages.append("订单主表")
+
+    # ====== Stage 4: 订单明细 ======
+    if not order_skipped and sync_orders:
+        try:
+            log.stage_begin("订单明细")
+            details = []
+            for o in sync_orders:
+                for d in (o.get("details") or []):
+                    details.append(transform_detail(o, d))
+            if details:
+                r = sync_table("order_detail", DETAIL_FIELDS, details, "detailId", args.dry_run)
+                log.stage_end("订单明细", f"{r['new']}新增/{r['updated']}更新 (已有{r['existing']})")
+                results.append(("订单明细", r))
+            else:
+                log.info("  订单明细: 无数据")
+                results.append(("订单明细", {"skipped": True, "reason": "无数据"}))
+        except Exception as e:
+            log.exception(f"订单明细同步异常")
+            results.append(("订单明细", {"error": str(e)}))
+            aborted_stages.append("订单明细")
+
+    # ====== Stage 5: 库存变动记录 ======
+    try:
+        log.stage_begin("库存变动记录")
+        inv_resp = pms_get("/pms/system/inventory/find-records", {"current":1,"size":100,"baseId":BASE_ID_PMS})
+        inv_total = inv_resp.get("total", 0)
+        inv_rows = inv_resp.get("rows", [])
+        page = 2
+        while len(inv_rows) < inv_total:
+            try:
+                r2 = pms_get("/pms/system/inventory/find-records", {"current":page,"size":100,"baseId":BASE_ID_PMS})
+                new_rows = r2.get("rows", [])
+                if not new_rows:
+                    break
+                inv_rows.extend(new_rows)
+                page += 1
+            except Exception as e:
+                log.warning(f"库存第{page}页拉取失败: {e}, 停止翻页")
+                break
+        log.debug(f"PMS 返回库存: {len(inv_rows)} 条 (total={inv_total})")
+
+        r = sync_table("inventory", INVENTORY_FIELDS, [transform_inventory(i) for i in inv_rows], "seqNum", args.dry_run)
+        log.stage_end("库存变动记录", f"{r['new']}新增/{r['updated']}更新 (已有{r['existing']}) 总{len(inv_rows)}条")
+        results.append(("库存变动记录", r))
+    except Exception as e:
+        log.exception(f"库存变动记录同步异常")
+        results.append(("库存变动记录", {"error": str(e)}))
+        aborted_stages.append("库存变动记录")
+
+    # ====== 生命周期：汇总 ======
+    log.lifecycle("同步结束，生成汇总...")
+    extra_errors = len(aborted_stages)
+    if aborted_stages:
+        log.error(f"以下阶段异常中断: {', '.join(aborted_stages)}")
+
+    summary = {
+        "mode": mode,
+        "dryRun": args.dry_run,
+        "date": datetime.datetime.now().isoformat(),
+        "results": {n: r for n, r in results},
+    }
+    log.info(json.dumps(summary, ensure_ascii=False, indent=2))
+
+    exit_code = log.summary(extra_errors)
+    sys.exit(exit_code)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        log.warning("用户中断 (Ctrl+C)")
+        log.summary()
+        sys.exit(130)
+    except SystemExit:
+        raise
+    except Exception as e:
+        log.exception(f"未捕获的致命异常: {e}")
+        log.summary(extra_errors=1)
+        sys.exit(1)

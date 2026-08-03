@@ -1,0 +1,23 @@
+# 日志
+logs/
+
+# PyInstaller
+build/
+dist/
+*.spec.bak
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+
+# 敏感文件（token 等）
+*.token
+.env

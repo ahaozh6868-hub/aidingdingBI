@@ -1,0 +1,59 @@
+name: Build Windows EXE
+
+on:
+  push:
+    paths:
+      - 'pms_sync.py'
+      - 'pms_sync.spec'
+      - '.github/workflows/build.yml'
+  workflow_dispatch:   # 允许手动触发
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install pyinstaller certifi
+
+      - name: Build EXE
+        run: pyinstaller pms_sync.spec --clean --noconfirm --log-level WARN
+
+      - name: Create release package
+        shell: cmd
+        run: |
+          mkdir release_pms_sync
+          copy dist\pms_sync.exe release_pms_sync\
+          (
+            echo PMS同步工具 - 使用说明
+            echo ======================
+            echo.
+            echo 一、环境要求
+            echo   - Windows 7/10/11 (64位^)
+            echo   - 必须安装 dws CLI 工具
+            echo.
+            echo 二、安装 dws
+            echo   npm install -g dingtalk-workspace-cli
+            echo   或下载 dws.exe 放到 pms_sync.exe 同级目录
+            echo.
+            echo 三、运行命令
+            echo   pms_sync.exe --token "Bearer TOKEN"         增量同步昨天
+            echo   pms_sync.exe --token "Bearer TOKEN" --dry-run  仅检查
+            echo   pms_sync.exe --token "Bearer TOKEN" --full   全量同步
+            echo.
+            echo 四、日志
+            echo   每次运行后自动在程序所在目录创建 logs\ 文件夹
+          ) > release_pms_sync\使用说明.txt
+
+      - name: Upload EXE
+        uses: actions/upload-artifact@v4
+        with:
+          name: pms_sync_windows
+          path: release_pms_sync/
+          retention-days: 30
