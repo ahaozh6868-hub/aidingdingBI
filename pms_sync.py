@@ -246,7 +246,7 @@ def pms_get(path, params=None):
 def pms_post(path, body):
     url = PMS_BASE + path
     data = json.dumps(body).encode("utf-8")
-    log.debug(f"POST {url} (body:{len(data)} bytes)")
+    log.debug(f"POST {url} (body:{len(data)} bytes)\n--- REQUEST BODY ---\n{json.dumps(body, ensure_ascii=False)}\n--- END ---")
     req = urllib.request.Request(PMS_BASE + path, data=data,
         headers={"Authorization": PMS_TOKEN, "Content-Type": "application/json"}, method="POST")
     try:
@@ -263,6 +263,49 @@ def pms_post(path, body):
     except Exception as e:
         log.error(f"POST {url} → {type(e).__name__}: {e}")
         raise
+
+# ====== 通用分页拉取 ======
+def pms_fetch_all_post(path, body, page_size=100):
+    """POST 分页拉取全部数据，自动翻页直到 rows 数量 >= total"""
+    body["current"] = 1
+    body["size"] = page_size
+    resp = pms_post(path, dict(body))
+    total = resp.get("total", 0)
+    rows = list(resp.get("rows", []))
+    log.debug(f"[分页POST] {path}: page=1, got={len(resp.get('rows',[]))}, total={total}")
+    page = 2
+    while len(rows) < total:
+        body["current"] = page
+        resp = pms_post(path, dict(body))
+        new_rows = resp.get("rows", [])
+        if not new_rows:
+            log.warning(f"[分页POST] {path}: 第{page}页返回空, 停止翻页")
+            break
+        rows.extend(new_rows)
+        log.debug(f"[分页POST] {path}: page={page}, got={len(new_rows)}, accumulated={len(rows)}/{total}")
+        page += 1
+    return rows
+
+def pms_fetch_all_get(path, params, page_size=100):
+    """GET 分页拉取全部数据，自动翻页直到 rows 数量 >= total"""
+    params["current"] = 1
+    params["size"] = page_size
+    resp = pms_get(path, dict(params))
+    total = resp.get("total", 0)
+    rows = list(resp.get("rows", []))
+    log.debug(f"[分页GET] {path}: page=1, got={len(resp.get('rows',[]))}, total={total}")
+    page = 2
+    while len(rows) < total:
+        params["current"] = page
+        resp = pms_get(path, dict(params))
+        new_rows = resp.get("rows", [])
+        if not new_rows:
+            log.warning(f"[分页GET] {path}: 第{page}页返回空, 停止翻页")
+            break
+        rows.extend(new_rows)
+        log.debug(f"[分页GET] {path}: page={page}, got={len(new_rows)}, accumulated={len(rows)}/{total}")
+        page += 1
+    return rows
 
 def dws_cmd(args):
     dws_bin = _find_dws()
@@ -568,9 +611,7 @@ def main():
     # ====== Stage 1: 物料表 ======
     try:
         log.stage_begin("物料表")
-        mats_resp = pms_post("/pms/system/kc/material/list", {"current":1,"size":100,"baseId":BASE_ID_PMS})
-        log.debug(f"PMS 物料原始响应 keys: {list(mats_resp.keys())}, rows={len(mats_resp.get('rows',[]))}, total={mats_resp.get('total','N/A')}")
-        mats = mats_resp.get("rows",[])
+        mats = pms_fetch_all_post("/pms/system/kc/material/list", {"baseId":BASE_ID_PMS})
         log.debug(f"PMS 返回物料: {len(mats)} 条")
         r = sync_table("material", MATERIAL_FIELDS, [transform_material(m) for m in mats], "num", args.dry_run)
         if r is None:
@@ -587,9 +628,7 @@ def main():
     # ====== Stage 2: 仓库表 ======
     try:
         log.stage_begin("仓库表")
-        whs_resp = pms_get("/pms/system/warehouse/list", {"baseId":BASE_ID_PMS})
-        log.debug(f"PMS 仓库原始响应 keys: {list(whs_resp.keys())}, rows={len(whs_resp.get('rows',[]))}, total={whs_resp.get('total','N/A')}")
-        whs = whs_resp.get("rows",[])
+        whs = pms_fetch_all_get("/pms/system/warehouse/list", {"baseId":BASE_ID_PMS})
         log.debug(f"PMS 返回仓库: {len(whs)} 条")
         r = sync_table("warehouse", WAREHOUSE_FIELDS, [transform_warehouse(w) for w in whs], "code", args.dry_run)
         if r is None:
@@ -608,9 +647,7 @@ def main():
     order_skipped = False
     try:
         log.stage_begin("订单主表")
-        orders_resp = pms_post("/pms/kc/order/list", {"current":1,"size":100,"baseId":BASE_ID_PMS})
-        log.debug(f"PMS 订单原始响应 keys: {list(orders_resp.keys())}, rows={len(orders_resp.get('rows',[]))}, total={orders_resp.get('total','N/A')}")
-        orders = orders_resp.get("rows", [])
+        orders = pms_fetch_all_post("/pms/kc/order/list", {"baseId":BASE_ID_PMS})
         log.debug(f"PMS 返回订单列表: {len(orders)} 条")
 
         # 获取完整订单详情
@@ -698,23 +735,8 @@ def main():
     # ====== Stage 5: 库存变动记录 ======
     try:
         log.stage_begin("库存变动记录")
-        inv_resp = pms_get("/pms/system/inventory/find-records", {"current":1,"size":100,"baseId":BASE_ID_PMS})
-        log.debug(f"PMS 库存原始响应 keys: {list(inv_resp.keys())}, rows={len(inv_resp.get('rows',[]))}, total={inv_resp.get('total','N/A')}")
-        inv_total = inv_resp.get("total", 0)
-        inv_rows = inv_resp.get("rows", [])
-        page = 2
-        while len(inv_rows) < inv_total:
-            try:
-                r2 = pms_get("/pms/system/inventory/find-records", {"current":page,"size":100,"baseId":BASE_ID_PMS})
-                new_rows = r2.get("rows", [])
-                if not new_rows:
-                    break
-                inv_rows.extend(new_rows)
-                page += 1
-            except Exception as e:
-                log.warning(f"库存第{page}页拉取失败: {e}, 停止翻页")
-                break
-        log.debug(f"PMS 返回库存: {len(inv_rows)} 条 (total={inv_total})")
+        inv_rows = pms_fetch_all_get("/pms/system/inventory/find-records", {"baseId":BASE_ID_PMS})
+        log.debug(f"PMS 返回库存: {len(inv_rows)} 条")
 
         r = sync_table("inventory", INVENTORY_FIELDS, [transform_inventory(i) for i in inv_rows], "recordNum", args.dry_run)
         if r is None:
