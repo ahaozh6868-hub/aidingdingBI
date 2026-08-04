@@ -375,7 +375,7 @@ def dws_cmd(args):
     log.debug(f"DWS: {dws_bin} {' '.join(args[:6])}...")
     try:
         result = subprocess.run([dws_bin] + args, capture_output=True,
-                                text=True, timeout=120)
+                                text=True, encoding='utf-8', errors='replace', timeout=120)
     except FileNotFoundError:
         log.error(f"DWS 执行失败: 找不到 {dws_bin}")
         log.error("请确保 dws CLI 已正确安装: npm install -g --allow-scripts=dingtalk-workspace-cli dingtalk-workspace-cli")
