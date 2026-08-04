@@ -27,6 +27,7 @@ jobs:
           pip install pyinstaller certifi
 
       - name: 构建 exe（基于 NewScripts/）
+        shell: cmd
         run: |
           cd NewScripts
           pyinstaller pms_sync.spec --clean --noconfirm
@@ -41,7 +42,7 @@ jobs:
             echo    npm install -g --allow-scripts=dingtalk-workspace-cli dingtalk-workspace-cli
             echo    then: dws auth login
             echo.
-            echo 2. Double-click "build_exe.bat" OR run:
+            echo 2. Run:
             echo    pms_sync.exe --token "Bearer YOUR_TOKEN"
             echo    pms_sync.exe --token "Bearer YOUR_TOKEN" --dry-run
             echo    pms_sync.exe --token "Bearer YOUR_TOKEN" --full
