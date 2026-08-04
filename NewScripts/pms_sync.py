@@ -9,7 +9,7 @@ PMS → AI钉钉表格 增量同步脚本 v3
   python3 pms_sync.py --token "Bearer xxx" --dry-run   # 只检查不写入
 """
 import argparse, json, subprocess, urllib.request, urllib.error, datetime, sys, os, ssl, certifi
-import logging, logging.handlers, traceback, time, io
+import logging, logging.handlers, traceback, time, io, tempfile
 
 # Windows 控制台编码修复：强制 stdout/stderr 用 utf-8，避免 → 等字符在 cp1252 下崩溃
 if hasattr(sys.stdout, 'reconfigure'):
@@ -370,34 +370,19 @@ def pms_fetch_all_get(path, params, page_size=100):
     return rows
 
 def dws_cmd(args):
+    """执行 dws CLI 命令（仅用于 query/delete 等短命令，--records 大数据走 _batch_write）"""
     dws_bin = _find_dws()
-    dws_bin_quoted = f'"{dws_bin}"' if " " in dws_bin and not dws_bin.startswith('"') else dws_bin
     log.debug(f"DWS: {dws_bin} {' '.join(args[:6])}...")
-
-    # Windows: 直接用 shell=True，最稳定，不会被 cmd/node 路径间歇性问题影响
-    if sys.platform == "win32":
-        cmd_str = f"{dws_bin_quoted} {' '.join(args)}"
-        try:
-            result = subprocess.run(cmd_str, capture_output=True, text=True,
-                                    encoding='utf-8', errors='replace',
-                                    timeout=120, shell=True)
-        except FileNotFoundError:
-            log.error(f"DWS 执行失败: {dws_bin} (shell=True also failed)")
-            log.error("请确保 dws CLI 已正确安装: npm install -g --allow-scripts=dingtalk-workspace-cli dingtalk-workspace-cli")
-            return {"success": False, "error": f"dws not found: {dws_bin}"}
-        except subprocess.TimeoutExpired:
-            log.error(f"DWS 命令超时 (>120s): {' '.join(args[:6])}")
-            return {"success": False, "error": "timeout"}
-    else:
-        try:
-            result = subprocess.run([dws_bin] + args, capture_output=True,
-                                    text=True, timeout=120)
-        except FileNotFoundError:
-            log.error(f"DWS 执行失败: 找不到 {dws_bin}")
-            return {"success": False, "error": f"dws not found: {dws_bin}"}
-        except subprocess.TimeoutExpired:
-            log.error(f"DWS 命令超时 (>120s): {' '.join(args[:6])}")
-            return {"success": False, "error": "timeout"}
+    try:
+        result = subprocess.run([dws_bin] + args, capture_output=True,
+                                text=True, timeout=120)
+    except FileNotFoundError:
+        log.error(f"DWS 执行失败: 找不到 {dws_bin}")
+        log.error("请确保 dws CLI 已正确安装: npm install -g --allow-scripts=dingtalk-workspace-cli dingtalk-workspace-cli")
+        return {"success": False, "error": f"dws not found: {dws_bin}"}
+    except subprocess.TimeoutExpired:
+        log.error(f"DWS 命令超时 (>120s): {' '.join(args[:6])}")
+        return {"success": False, "error": "timeout"}
 
     if result.returncode != 0:
         log.warning(f"DWS 返回非零: {result.returncode}")
@@ -627,29 +612,41 @@ def sync_table(table_key, fields, records, key_field, dry_run=False, full_mode=F
         result["dry_run"] = True
         return result
 
-    # Create (batch 100)
-    for i in range(0, len(to_create), 100):
-        batch = to_create[i:i+100]
-        resp = dws_cmd(["aitable","record","create","--base-id",AI_BASE_ID,"--table-id",AI_TABLES[table_key],
-                 "--records", json.dumps(batch, ensure_ascii=False), "--format","json"])
-        if resp.get("success"):
-            result["create_ok"] += len(batch)
-        else:
-            result["create_fail"] += len(batch)
-            log.warning(f"  [{table_key}] CREATE 批次失败 ({len(batch)}条): {resp.get('error','')[:100]}")
+    # Create/Update: JSON 通过 stdin 管道传入，避免 Windows 命令行长度限制
+    BATCH_SIZE = 100
 
-    # Update (batch 100)
-    for i in range(0, len(to_update), 100):
-        batch = to_update[i:i+100]
-        resp = dws_cmd(["aitable","record","update","--base-id",AI_BASE_ID,"--table-id",AI_TABLES[table_key],
-                 "--records", json.dumps(batch, ensure_ascii=False), "--format","json"])
-        if resp.get("success"):
-            result["update_ok"] += len(batch)
-        else:
-            result["update_fail"] += len(batch)
-            log.warning(f"  [{table_key}] UPDATE 批次失败 ({len(batch)}条): {resp.get('error','')[:100]}")
+    def _batch_write(action, items, batch_size=BATCH_SIZE):
+        ok, fail = 0, 0
+        for i in range(0, len(items), batch_size):
+            batch = items[i:i+batch_size]
+            batch_json = json.dumps(batch, ensure_ascii=False)
+            dws_bin = _find_dws()
+            log.debug(f"DWS(batch-{action}): {len(batch)} records, json={len(batch_json)} bytes")
+            try:
+                result = subprocess.run(
+                    [dws_bin, "aitable", "record", action,
+                     "--base-id", AI_BASE_ID, "--table-id", AI_TABLES[table_key],
+                     "--records", batch_json, "--format", "json"],
+                    capture_output=True, text=True,
+                    encoding='utf-8', errors='replace', timeout=120
+                )
+                if result.returncode == 0:
+                    ok += len(batch)
+                else:
+                    fail += len(batch)
+                    log.warning(f"  [{table_key}] {action.upper()} 批次失败 ({len(batch)}条): {(result.stderr or '')[:150]}")
+            except FileNotFoundError:
+                fail += len(batch)
+                log.warning(f"  [{table_key}] {action.upper()} 批次 dws 未找到 ({len(batch)}条)")
+            except subprocess.TimeoutExpired:
+                fail += len(batch)
+                log.warning(f"  [{table_key}] {action.upper()} 超时 ({len(batch)}条)")
+        return ok, fail
 
-    # Delete orphans（批量删除，最多100条/批；--yes 跳过交互确认，否则 dws 在非交互环境会卡住超时）
+    result["create_ok"], result["create_fail"] = _batch_write("create", to_create)
+    result["update_ok"], result["update_fail"] = _batch_write("update", to_update)
+
+    # Delete orphans（批量删除，最多100条/批；--yes 跳过交互确认）
     for i in range(0, len(to_delete), 100):
         batch = to_delete[i:i+100]
         resp = dws_cmd(["aitable","record","delete","--base-id",AI_BASE_ID,"--table-id",AI_TABLES[table_key],
@@ -902,25 +899,31 @@ def main():
             results.append(("订单明细", {"error": str(e)}))
             aborted_stages.append("订单明细")
 
-    # ====== Stage 5: 库存变动记录（增量：最近3天） ======
+    # ====== Stage 5: 库存变动记录 ======
     try:
         log.stage_begin("库存变动记录")
         inv_all = pms_fetch_all_get("/pms/system/inventory/find-records", {"baseId":BASE_ID_PMS})
         log.debug(f"PMS 返回库存: {len(inv_all)} 条")
 
-        # 按目标日期过滤库存记录
-        recent_inv = [i for i in inv_all if any((i.get("operationTime") or "").startswith(d) for d in target_days)]
-        log.info(f"  目标日期({target_days[0]}{'~' + target_days[-1] if len(target_days) > 1 else ''})库存变动: {len(recent_inv)} 条 (总{len(inv_all)})")
-        if not recent_inv:
-            log.info("  库存变动: 无目标日期数据, 跳过")
-            results.append(("库存变动记录", {"skipped": True, "reason": "无目标日期数据"}))
+        if args.full:
+            # 全量：全部库存，不过滤日期
+            sync_inv = inv_all
+            log.info(f"  全量库存: {len(sync_inv)} 条")
         else:
-            r = sync_table("inventory", INVENTORY_FIELDS, [transform_inventory(i) for i in recent_inv], "recordNum", args.dry_run, skip_update=not args.full)
+            # 增量：按 target_days 过滤
+            sync_inv = [i for i in inv_all if any((i.get("operationTime") or "").startswith(d) for d in target_days)]
+            log.info(f"  目标日期({target_days[0]}{'~' + target_days[-1] if len(target_days) > 1 else ''})库存变动: {len(sync_inv)} 条 (总{len(inv_all)})")
+
+        if not sync_inv:
+            log.info("  库存变动: 无数据, 跳过")
+            results.append(("库存变动记录", {"skipped": True, "reason": "无数据"}))
+        else:
+            r = sync_table("inventory", INVENTORY_FIELDS, [transform_inventory(i) for i in sync_inv], "recordNum", args.dry_run, skip_update=not args.full)
             if r is None:
                 log.stage_end("库存变动记录", "跳过（无权限/认证失败）")
                 results.append(("库存变动记录", {"skipped": True, "reason": "dws权限不足"}))
             else:
-                log.stage_end("库存变动记录", f"{r['new']}新增/{r.get('skipped',r.get('updated',0))}跳过 (已有{r['existing']}) 目标{len(recent_inv)}/总{len(inv_all)}条")
+                log.stage_end("库存变动记录", f"{r['new']}新增/{r.get('skipped',r.get('updated',0))}跳过 (已有{r['existing']}) 本次{len(sync_inv)}/总{len(inv_all)}条")
                 results.append(("库存变动记录", r))
     except Exception as e:
         log.exception(f"库存变动记录同步异常")
