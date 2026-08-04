@@ -29,11 +29,11 @@ jobs:
       - name: 构建 exe
         run: |
           cd NewScripts
-          pyinstaller pms_sync.spec --clean --noconfirm
-          dir dist\
-          New-Item -ItemType Directory -Force -Path ..\release_pms_sync | Out-Null
-          Copy-Item dist\pms_sync.exe ..\release_pms_sync\
-          New-Item -ItemType File -Path ..\release_pms_sync\使用说明.txt -Force -Value @"
+          pyinstaller --clean --noconfirm --onefile --console --name pms_sync --hidden-import certifi --hidden-import certifi.core --hidden-import ssl --hidden-import json --hidden-import argparse --hidden-import urllib --hidden-import urllib.request --hidden-import urllib.error --hidden-import urllib.parse --hidden-import subprocess --hidden-import datetime --hidden-import sys --hidden-import os --hidden-import logging --hidden-import logging.handlers --hidden-import traceback --hidden-import time --hidden-import io --collect-data certifi pms_sync.py
+          if (-not (Test-Path dist\pms_sync.exe)) { throw "EXE not built" }
+          New-Item -ItemType Directory -Force -Path ..\release | Out-Null
+          Copy-Item dist\pms_sync.exe ..\release\
+          Set-Content -Path ..\release\README.txt -Value @"
           PMS Sync Tool
           =============
           1. npm install -g --allow-scripts=dingtalk-workspace-cli dingtalk-workspace-cli
@@ -41,20 +41,19 @@ jobs:
           2. pms_sync.exe --token "Bearer TOKEN"
              pms_sync.exe --token "Bearer TOKEN" --dry-run
              pms_sync.exe --token "Bearer TOKEN" --full
-          3. Logs: pms_sync.exe folder\logs\
-          "@
+          3. Logs in: pms_sync.exe folder\logs\
+          "@ -Encoding utf8
 
       - name: 上传 exe 产物
         uses: actions/upload-artifact@v4
         with:
           name: pms_sync_windows
-          path: release_pms_sync/
+          path: release/
           if-no-files-found: error
 
-      # 打 tag (如 v1.0) 时额外创建 Release
       - name: 创建 GitHub Release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: release_pms_sync/pms_sync.exe
+          files: release/pms_sync.exe
           generate_release_notes: true
