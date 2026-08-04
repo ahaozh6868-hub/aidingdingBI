@@ -691,7 +691,7 @@ def main():
                 break
         log.debug(f"PMS 返回库存: {len(inv_rows)} 条 (total={inv_total})")
 
-        r = sync_table("inventory", INVENTORY_FIELDS, [transform_inventory(i) for i in inv_rows], "seqNum", args.dry_run)
+        r = sync_table("inventory", INVENTORY_FIELDS, [transform_inventory(i) for i in inv_rows], "recordNum", args.dry_run)
         if r is None:
             log.stage_end("库存变动记录", "跳过（无权限/认证失败）")
             results.append(("库存变动记录", {"skipped": True, "reason": "dws权限不足"}))
