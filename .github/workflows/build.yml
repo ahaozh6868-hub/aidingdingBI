@@ -26,29 +26,22 @@ jobs:
           python -m pip install --upgrade pip
           pip install pyinstaller certifi
 
-      - name: 构建 exe（基于 NewScripts/）
+      - name: 构建 exe
         run: |
-          cd NewScripts
-          python -m PyInstaller pms_sync.spec --clean --noconfirm
-          if (-not (Test-Path dist\pms_sync.exe)) { throw "Build failed: dist\pms_sync.exe not found" }
-          New-Item -ItemType Directory -Force -Path ..\release_pms_sync | Out-Null
-          Copy-Item dist\pms_sync.exe ..\release_pms_sync\
-          Copy-Item build_exe.bat ..\release_pms_sync\
-          @"
-          PMS Sync Tool - User Guide
-          ==========================
-
-          1. Install dws CLI:
-             npm install -g --allow-scripts=dingtalk-workspace-cli dingtalk-workspace-cli
+          pyinstaller --clean --noconfirm --distpath release_pms_sync --workpath build --specpath . NewScripts\pms_sync.spec
+          Move-Item -Force release_pms_sync\pms_sync\* release_pms_sync\
+          Remove-Item -Recurse -Force release_pms_sync\pms_sync -ErrorAction SilentlyContinue
+          New-Item -ItemType File -Path release_pms_sync\使用说明.txt -Force -Value @"
+          PMS Sync Tool
+          =============
+          1. Install dws: npm install -g --allow-scripts=dingtalk-workspace-cli dingtalk-workspace-cli
              then: dws auth login
-
-          2. Run:
-             pms_sync.exe --token "Bearer YOUR_TOKEN"
-             pms_sync.exe --token "Bearer YOUR_TOKEN" --dry-run
-             pms_sync.exe --token "Bearer YOUR_TOKEN" --full
-
-          3. Logs auto-saved to: pms_sync.exe\logs\
-          "@ | Out-File -FilePath ..\release_pms_sync\README.txt -Encoding utf8
+          2. Run: pms_sync.exe --token "Bearer TOKEN"
+                  pms_sync.exe --token "Bearer TOKEN" --dry-run
+                  pms_sync.exe --token "Bearer TOKEN" --full
+          3. Logs: pms_sync.exe\logs\
+          "@
+          Get-ChildItem release_pms_sync\ | ForEach-Object { $_.Name }
 
       - name: 上传 exe 产物
         uses: actions/upload-artifact@v4
