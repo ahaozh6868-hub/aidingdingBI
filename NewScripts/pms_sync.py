@@ -644,32 +644,23 @@ def sync_table(table_key, fields, records, key_field, dry_run=False, full_mode=F
         result["dry_run"] = True
         return result
 
-    # 文件重定向：JSON写临时文件，cmd /c type 文件 | dws --records - 避免 Python stdin pipe 加空格
     _cached_dws = _find_dws()
 
     def _batch_write(action, items):
-        """JSON写临时文件，用 cmd /c type 文件 | dws --records - 重定向"""
+        """每批 10 条，命令行 ~12000 WCHARs << 32767 限制"""
         ok, fail = 0, 0
-        for i in range(0, len(items), 50):
-            batch = items[i:i+50]
+        for i in range(0, len(items), 10):
+            batch = items[i:i+10]
             batch_json = json.dumps(batch, ensure_ascii=False)
-            tmp = os.path.join(SCRIPT_DIR, f"_pms_{action}.json")
-            with open(tmp, 'wb') as f:
-                f.write(batch_json.encode('utf-8'))
-            # chcp 65001 + type 文件 | dws --records -
-            cmd = f'cmd /c "type "{tmp}" | "{_cached_dws}" aitable record {action} --base-id {AI_BASE_ID} --table-id {AI_TABLES[table_key]} --records - --format json"'
-            log.debug(f"DWS(pipe-{action}): {len(batch)} records")
-            result = None
+            cmd = [_cached_dws, "aitable", "record", action,
+                   "--base-id", AI_BASE_ID, "--table-id", AI_TABLES[table_key],
+                   "--records", batch_json, "--format", "json"]
+            log.debug(f"DWS({action}): {len(batch)} records ({len(batch_json)} bytes)")
             try:
-                result = subprocess.run(cmd, capture_output=True, shell=True, timeout=120)
+                result = subprocess.run(cmd, capture_output=True, timeout=120)
             except subprocess.TimeoutExpired:
-                fail += len(batch)
-            finally:
-                try: os.unlink(tmp)
-                except: pass
-            if result is None:
-                continue
-            def _dec(b):
+                fail += len(batch); continue
+            def _d(b):
                 if b is None: return ""
                 try: return b.decode('utf-8')
                 except: return b.decode('gbk', errors='replace')
@@ -677,7 +668,8 @@ def sync_table(table_key, fields, records, key_field, dry_run=False, full_mode=F
                 ok += len(batch)
             else:
                 fail += len(batch)
-                log.warning(f"  [{table_key}] {action.upper()} fail ({len(batch)}): {_dec(result.stderr)[:200]}")
+                log.warning(f"  [{table_key}] {action.upper()} fail ({len(batch)}): {_d(result.stderr)[:200]}")
+        return ok, fail
         return ok, fail
 
     result["create_ok"], result["create_fail"] = _batch_write("create", to_create)
