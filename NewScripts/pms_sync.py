@@ -9,7 +9,7 @@ PMS → AI钉钉表格 增量同步脚本 v3
   python3 pms_sync.py --token "Bearer xxx" --dry-run   # 只检查不写入
 """
 import argparse, json, subprocess, urllib.request, urllib.error, datetime, sys, os, ssl, certifi
-import logging, logging.handlers, traceback, time, io, tempfile
+import logging, logging.handlers, traceback, time, io
 
 # Windows 控制台编码修复：强制 stdout/stderr 用 utf-8，避免 → 等字符在 cp1252 下崩溃
 if hasattr(sys.stdout, 'reconfigure'):
@@ -644,46 +644,33 @@ def sync_table(table_key, fields, records, key_field, dry_run=False, full_mode=F
         result["dry_run"] = True
         return result
 
-    # Create/Update: dws 路径只找一次，Windows 命令行 ≤ 32767 字符
-    BATCH_SIZE = 100
+    # dws 路径缓存一次 + 临时文件绕过命令行长度限制
     _cached_dws = _find_dws()
 
-    def _batch_write(action, items, batch_size=BATCH_SIZE):
-        """批量写入：自动降批防止 Windows 命令行超长（32767字符限制）"""
+    def _batch_write(action, items):
+        """JSON 写临时文件传路径，彻底绕开 Windows 32767 限制"""
         ok, fail = 0, 0
-        total = len(items)
-        idx = 0
-        while idx < total:
-            # 构建一个批次的 JSON，确保命令行总长 < 32000
-            batch = []
-            json_size = 0
-            while idx < total and json_size < 25000:  # 留 7000 给其他参数
-                item_json = json.dumps(items[idx], ensure_ascii=False)
-                comma = 1 if batch else 0
-                if json_size + len(item_json) + comma > 25000 and batch:
-                    break
-                batch.append(items[idx])
-                json_size += len(item_json) + comma
-                idx += 1
-            if not batch:
-                # 单条记录就超长，强制写入
-                batch = [items[idx]]
-                idx += 1
-
+        for i in range(0, len(items), 50):
+            batch = items[i:i+50]
             batch_json = json.dumps(batch, ensure_ascii=False)
+            tmp = os.path.join(SCRIPT_DIR, f"_pms_{action}.json")
+            with open(tmp, 'w', encoding='utf-8') as f:
+                f.write(batch_json)
             cmd = [_cached_dws, "aitable", "record", action,
                    "--base-id", AI_BASE_ID, "--table-id", AI_TABLES[table_key],
-                   "--records", batch_json, "--format", "json"]
-            log.debug(f"DWS(batch-{action}): {len(batch)} records ({json_size} bytes)")
-
+                   "--records", tmp, "--format", "json"]
+            log.debug(f"DWS(file-{action}): {len(batch)} records ({len(batch_json)} bytes)")
+            result = None
             try:
                 result = subprocess.run(cmd, capture_output=True, timeout=120)
             except subprocess.TimeoutExpired:
                 fail += len(batch)
-                idx += len(batch) if idx < total else 0
                 log.warning(f"  [{table_key}] {action.upper()} 超时 ({len(batch)}条)")
+            finally:
+                try: os.unlink(tmp)
+                except: pass
+            if result is None:
                 continue
-
             def _dec(b):
                 if b is None: return ""
                 try: return b.decode('utf-8')
