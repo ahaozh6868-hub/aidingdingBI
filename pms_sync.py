@@ -231,7 +231,7 @@ def pms_get(path, params=None):
     try:
         with urllib.request.urlopen(req, timeout=30, context=_get_ssl_context()) as resp:
             raw = resp.read()
-            log.debug(f"GET {url} → HTTP {resp.status} ({len(raw)} bytes)")
+            log.debug(f"GET {url} → HTTP {resp.status} ({len(raw)} bytes) body: {raw[:300].decode('utf-8', errors='replace')}")
             data = json.loads(raw)
             _check_pms_response(data, url)
             return data
@@ -252,7 +252,7 @@ def pms_post(path, body):
     try:
         with urllib.request.urlopen(req, timeout=30, context=_get_ssl_context()) as resp:
             raw = resp.read()
-            log.debug(f"POST {url} → HTTP {resp.status} ({len(raw)} bytes)")
+            log.debug(f"POST {url} → HTTP {resp.status} ({len(raw)} bytes) body: {raw[:300].decode('utf-8', errors='replace')}")
             data = json.loads(raw)
             _check_pms_response(data, url)
             return data
