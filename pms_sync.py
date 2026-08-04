@@ -255,10 +255,9 @@ def dws_cmd(args):
     try:
         result = subprocess.run([dws_bin] + args, capture_output=True, text=True, timeout=120)
     except FileNotFoundError:
-        log.error("未找到 dws CLI，请确保已安装 dingtalk-workspace-cli")
-        log.error("安装方法: npm install -g dingtalk-workspace-cli")
-        log.error("或将 dws.exe 放在 pms_sync.exe 同级目录，或使用 --dws-path 参数指定路径")
-        sys.exit(1)
+        log.error(f"DWS 执行失败: 找不到 {dws_bin}")
+        log.error("请确保已安装 dws CLI: npm install -g --allow-scripts=dingtalk-workspace-cli dingtalk-workspace-cli")
+        return {"success": False, "error": f"dws not found: {dws_bin}"}
     except subprocess.TimeoutExpired:
         log.error(f"DWS 命令超时 (>120s): {' '.join(args[:6])}")
         return {"success": False, "error": "timeout"}
@@ -273,11 +272,14 @@ def dws_cmd(args):
 
 # ====== 去重查询（分页） ======
 def query_existing_ids(table_key, field_id):
-    """查询已有记录，返回 key→recordId 的映射（自动分页）"""
+    """查询已有记录，返回 key→recordId 的映射（自动分页）。
+    返回 None 表示查询完全失败（权限/认证问题），不应继续写入。
+    返回 {} 表示查询成功但无记录。"""
     table_id = AI_TABLES[table_key]
     lookup = {}
     cursor = None
     page = 0
+    first_page_failed = False
     while True:
         page += 1
         args = ["aitable","record","query","--base-id",AI_BASE_ID,"--table-id",table_id,"--format","json"]
@@ -285,7 +287,16 @@ def query_existing_ids(table_key, field_id):
             args.extend(["--cursor", cursor])
         resp = dws_cmd(args)
         if not resp.get("success"):
-            log.warning(f"查询已有记录失败 [{table_key}] p{page}: {resp.get('error','')[:100]}")
+            err_msg = resp.get('error','')[:200]
+            log.warning(f"查询已有记录失败 [{table_key}] p{page}: {err_msg}")
+            if page == 1:
+                # 首页失败 = 没有读取权限或表不存在，标记为不可操作
+                first_page_failed = True
+                if "ResourceNotFound" in err_msg:
+                    log.error(f"  → [{table_key}] 表不存在或当前钉钉账号无访问权限！")
+                    log.error(f"  → 请确认账号已加入 AI表格 {AI_BASE_ID} 的协作者列表")
+                elif "access token" in err_msg.lower():
+                    log.error(f"  → [{table_key}] dws 未登录，请执行: dws auth login")
             break
         data = resp.get("data",{})
         records = data.get("records",[])
@@ -302,6 +313,8 @@ def query_existing_ids(table_key, field_id):
         cursor = data.get("nextCursor")
         if not cursor:
             break
+    if first_page_failed:
+        return None  # 完全失败，禁止写入
     log.debug(f"query_existing_ids [{table_key}]: {len(lookup)} 条 ({page} 页)")
     return lookup
 
@@ -423,9 +436,17 @@ def transform_inventory(i):
 
 # ====== 同步逻辑 ======
 def sync_table(table_key, fields, records, key_field, dry_run=False):
-    """同步单表：去重检查 + 新增/更新"""
+    """同步单表：去重检查 + 新增/更新
+    Returns None 表示因权限/认证问题无法操作，调用方应跳过
+    """
     key_fid = fields[key_field]
     existing = query_existing_ids(table_key, key_fid)
+
+    # 查询完全失败 → 禁止写入，防止因去重失效而重复创建
+    if existing is None:
+        log.error(f"  → [{table_key}] 无法查询已有记录，跳过同步（防止重复写入）")
+        return None
+
     to_create, to_update = [], []
     for item in records:
         cells = {fid: item[k] for k, fid in fields.items() if item.get(k) is not None}
@@ -434,20 +455,37 @@ def sync_table(table_key, fields, records, key_field, dry_run=False):
             to_update.append({"recordId": existing[kv], "cells": cells})
         else:
             to_create.append({"cells": cells})
-    result = {"table": table_key, "existing": len(existing), "new": len(to_create), "updated": len(to_update)}
+
+    result = {"table": table_key, "existing": len(existing),
+               "new": len(to_create), "updated": len(to_update),
+               "create_ok": 0, "create_fail": 0,
+               "update_ok": 0, "update_fail": 0}
     if dry_run:
         result["dry_run"] = True
         return result
-    # Create
+
+    # Create (batch 100)
     for i in range(0, len(to_create), 100):
         batch = to_create[i:i+100]
-        dws_cmd(["aitable","record","create","--base-id",AI_BASE_ID,"--table-id",AI_TABLES[table_key],
+        resp = dws_cmd(["aitable","record","create","--base-id",AI_BASE_ID,"--table-id",AI_TABLES[table_key],
                  "--records", json.dumps(batch, ensure_ascii=False), "--format","json"])
-    # Update
+        if resp.get("success"):
+            result["create_ok"] += len(batch)
+        else:
+            result["create_fail"] += len(batch)
+            log.warning(f"  [{table_key}] CREATE 批次失败 ({len(batch)}条): {resp.get('error','')[:100]}")
+
+    # Update (batch 100)
     for i in range(0, len(to_update), 100):
         batch = to_update[i:i+100]
-        dws_cmd(["aitable","record","update","--base-id",AI_BASE_ID,"--table-id",AI_TABLES[table_key],
+        resp = dws_cmd(["aitable","record","update","--base-id",AI_BASE_ID,"--table-id",AI_TABLES[table_key],
                  "--records", json.dumps(batch, ensure_ascii=False), "--format","json"])
+        if resp.get("success"):
+            result["update_ok"] += len(batch)
+        else:
+            result["update_fail"] += len(batch)
+            log.warning(f"  [{table_key}] UPDATE 批次失败 ({len(batch)}条): {resp.get('error','')[:100]}")
+
     return result
 
 def main():
@@ -514,8 +552,12 @@ def main():
         mats = pms_post("/pms/system/kc/material/list", {"current":1,"size":100,"baseId":BASE_ID_PMS}).get("rows",[])
         log.debug(f"PMS 返回物料: {len(mats)} 条")
         r = sync_table("material", MATERIAL_FIELDS, [transform_material(m) for m in mats], "num", args.dry_run)
-        log.stage_end("物料表", f"{r['new']}新增/{r['updated']}更新 (已有{r['existing']})")
-        results.append(("物料表", r))
+        if r is None:
+            log.stage_end("物料表", "跳过（无权限/认证失败）")
+            results.append(("物料表", {"skipped": True, "reason": "dws权限不足"}))
+        else:
+            log.stage_end("物料表", f"{r['new']}新增/{r['updated']}更新 (已有{r['existing']})")
+            results.append(("物料表", r))
     except Exception as e:
         log.exception(f"物料表同步异常")
         results.append(("物料表", {"error": str(e)}))
@@ -527,8 +569,12 @@ def main():
         whs = pms_get("/pms/system/warehouse/list", {"baseId":BASE_ID_PMS}).get("rows",[])
         log.debug(f"PMS 返回仓库: {len(whs)} 条")
         r = sync_table("warehouse", WAREHOUSE_FIELDS, [transform_warehouse(w) for w in whs], "code", args.dry_run)
-        log.stage_end("仓库表", f"{r['new']}新增/{r['updated']}更新 (已有{r['existing']})")
-        results.append(("仓库表", r))
+        if r is None:
+            log.stage_end("仓库表", "跳过（无权限/认证失败）")
+            results.append(("仓库表", {"skipped": True, "reason": "dws权限不足"}))
+        else:
+            log.stage_end("仓库表", f"{r['new']}新增/{r['updated']}更新 (已有{r['existing']})")
+            results.append(("仓库表", r))
     except Exception as e:
         log.exception(f"仓库表同步异常")
         results.append(("仓库表", {"error": str(e)}))
@@ -566,21 +612,33 @@ def main():
             log.debug(f"昨日的订单ID: {[o.get('orderId') for o in yesterday_orders]}")
 
             existing_orders = query_existing_ids("order_main", ORDER_FIELDS["orderId"])
-            already_synced = sum(1 for o in yesterday_orders if str(o.get("orderId")) in existing_orders)
-            if already_synced == len(yesterday_orders) and len(yesterday_orders) > 0:
-                log.warning(f"  ⚠ 昨日 {len(yesterday_orders)} 条订单已全部同步过，跳过")
-                results.append(("订单主表", {"skipped": True, "reason": "已同步", "existing": already_synced}))
-                results.append(("订单明细", {"skipped": True, "reason": "已同步"}))
+            if existing_orders is None:
+                # 查询失败 → 无法去重，跳过写入防止重复
+                log.warning(f"  ⚠ 无法查询订单已有记录（权限不足），跳过订单同步")
+                results.append(("订单主表", {"skipped": True, "reason": "dws权限不足"}))
+                results.append(("订单明细", {"skipped": True, "reason": "dws权限不足"}))
                 order_skipped = True
             else:
-                sync_orders = yesterday_orders
+                already_synced = sum(1 for o in yesterday_orders if str(o.get("orderId")) in existing_orders)
+                if already_synced == len(yesterday_orders) and len(yesterday_orders) > 0:
+                    log.warning(f"  ⚠ 昨日 {len(yesterday_orders)} 条订单已全部同步过，跳过")
+                    results.append(("订单主表", {"skipped": True, "reason": "已同步", "existing": already_synced}))
+                    results.append(("订单明细", {"skipped": True, "reason": "已同步"}))
+                    order_skipped = True
+                else:
+                    sync_orders = yesterday_orders
         else:
             sync_orders = full_orders
 
         if not order_skipped and sync_orders:
             r = sync_table("order_main", ORDER_FIELDS, [transform_order(o) for o in sync_orders], "orderId", args.dry_run)
-            log.stage_end("订单主表", f"{r['new']}新增/{r['updated']}更新 (已有{r['existing']})")
-            results.append(("订单主表", r))
+            if r is None:
+                log.stage_end("订单主表", "跳过（无权限/认证失败）")
+                results.append(("订单主表", {"skipped": True, "reason": "dws权限不足"}))
+                order_skipped = True  # 订单明细也跳过
+            else:
+                log.stage_end("订单主表", f"{r['new']}新增/{r['updated']}更新 (已有{r['existing']})")
+                results.append(("订单主表", r))
         elif not order_skipped:
             log.info("  订单主表: 无待同步订单")
             results.append(("订单主表", {"skipped": True, "reason": "无数据"}))
@@ -599,8 +657,12 @@ def main():
                     details.append(transform_detail(o, d))
             if details:
                 r = sync_table("order_detail", DETAIL_FIELDS, details, "detailId", args.dry_run)
-                log.stage_end("订单明细", f"{r['new']}新增/{r['updated']}更新 (已有{r['existing']})")
-                results.append(("订单明细", r))
+                if r is None:
+                    log.stage_end("订单明细", "跳过（无权限/认证失败）")
+                    results.append(("订单明细", {"skipped": True, "reason": "dws权限不足"}))
+                else:
+                    log.stage_end("订单明细", f"{r['new']}新增/{r['updated']}更新 (已有{r['existing']})")
+                    results.append(("订单明细", r))
             else:
                 log.info("  订单明细: 无数据")
                 results.append(("订单明细", {"skipped": True, "reason": "无数据"}))
@@ -630,8 +692,12 @@ def main():
         log.debug(f"PMS 返回库存: {len(inv_rows)} 条 (total={inv_total})")
 
         r = sync_table("inventory", INVENTORY_FIELDS, [transform_inventory(i) for i in inv_rows], "seqNum", args.dry_run)
-        log.stage_end("库存变动记录", f"{r['new']}新增/{r['updated']}更新 (已有{r['existing']}) 总{len(inv_rows)}条")
-        results.append(("库存变动记录", r))
+        if r is None:
+            log.stage_end("库存变动记录", "跳过（无权限/认证失败）")
+            results.append(("库存变动记录", {"skipped": True, "reason": "dws权限不足"}))
+        else:
+            log.stage_end("库存变动记录", f"{r['new']}新增/{r['updated']}更新 (已有{r['existing']}) 总{len(inv_rows)}条")
+            results.append(("库存变动记录", r))
     except Exception as e:
         log.exception(f"库存变动记录同步异常")
         results.append(("库存变动记录", {"error": str(e)}))
