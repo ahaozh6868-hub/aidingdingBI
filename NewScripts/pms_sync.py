@@ -644,24 +644,30 @@ def sync_table(table_key, fields, records, key_field, dry_run=False, full_mode=F
         result["dry_run"] = True
         return result
 
-    # stdin管道：JSON 走 stdin 不占命令行，50条/批平衡效率
+    # 文件重定向：JSON写临时文件，cmd /c type 文件 | dws --records - 避免 Python stdin pipe 加空格
     _cached_dws = _find_dws()
 
     def _batch_write(action, items):
-        """JSON 走 stdin 管道，命令行仅 --records -，不受 32767 限制"""
+        """JSON写临时文件，用 cmd /c type 文件 | dws --records - 重定向"""
         ok, fail = 0, 0
         for i in range(0, len(items), 50):
             batch = items[i:i+50]
             batch_json = json.dumps(batch, ensure_ascii=False)
-            cmd = [_cached_dws, "aitable", "record", action,
-                   "--base-id", AI_BASE_ID, "--table-id", AI_TABLES[table_key],
-                   "--records", "-", "--format", "json"]
-            log.debug(f"DWS(stdin-{action}): {len(batch)} records")
+            tmp = os.path.join(SCRIPT_DIR, f"_pms_{action}.json")
+            with open(tmp, 'wb') as f:
+                f.write(batch_json.encode('utf-8'))
+            # chcp 65001 + type 文件 | dws --records -
+            cmd = f'chcp 65001 >nul && type "{tmp}" | "{_cached_dws}" aitable record {action} --base-id {AI_BASE_ID} --table-id {AI_TABLES[table_key]} --records - --format json'
+            log.debug(f"DWS(pipe-{action}): {len(batch)} records")
+            result = None
             try:
-                result = subprocess.run(cmd, input=batch_json.encode('utf-8'),
-                                        capture_output=True, timeout=120)
+                result = subprocess.run(cmd, capture_output=True, shell=True, timeout=120)
             except subprocess.TimeoutExpired:
                 fail += len(batch)
+            finally:
+                try: os.unlink(tmp)
+                except: pass
+            if result is None:
                 continue
             def _dec(b):
                 if b is None: return ""
@@ -671,7 +677,7 @@ def sync_table(table_key, fields, records, key_field, dry_run=False, full_mode=F
                 ok += len(batch)
             else:
                 fail += len(batch)
-                log.warning(f"  [{table_key}] {action.upper()} fail ({len(batch)}): {_dec(result.stderr)[:150]}")
+                log.warning(f"  [{table_key}] {action.upper()} fail ({len(batch)}): {_dec(result.stderr)[:200]}")
         return ok, fail
 
     result["create_ok"], result["create_fail"] = _batch_write("create", to_create)
