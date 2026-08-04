@@ -369,64 +369,41 @@ def pms_fetch_all_get(path, params, page_size=100):
         page += 1
     return rows
 
-def _build_dws_cmd(dws_bin, args):
-    """构建 dws 执行命令：Windows 优先直连 node 绕过 cmd /c"""
-    if sys.platform == "win32" and dws_bin.lower().endswith(".cmd"):
-        dws_dir = os.path.dirname(dws_bin)
-        dws_js = os.path.join(dws_dir, "node_modules", "dingtalk-workspace-cli", "bin", "dws.js")
-        if os.path.isfile(dws_js):
-            node_bin = None
-            local_node = os.path.join(dws_dir, "node.exe")
-            if os.path.isfile(local_node):
-                node_bin = local_node
-            if not node_bin:
-                try:
-                    nr = subprocess.run(["where", "node"], capture_output=True, text=True, timeout=5)
-                    if nr.returncode == 0 and nr.stdout.strip():
-                        node_bin = nr.stdout.strip().splitlines()[0].strip()
-                except Exception:
-                    pass
-            if node_bin and os.path.isfile(node_bin):
-                log.debug(f"DWS(直连node): {node_bin} {dws_js}")
-                return [node_bin, dws_js] + args
-    # 回退
-    if sys.platform == "win32" and dws_bin.lower().endswith((".cmd", ".bat")):
-        return ["cmd", "/c", dws_bin] + args
-    return [dws_bin] + args
-
 def dws_cmd(args):
     dws_bin = _find_dws()
+    dws_bin_quoted = f'"{dws_bin}"' if " " in dws_bin and not dws_bin.startswith('"') else dws_bin
     log.debug(f"DWS: {dws_bin} {' '.join(args[:6])}...")
-    cmd = _build_dws_cmd(dws_bin, args)
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=120)
-    except FileNotFoundError:
-        # 间歇性找不到文件：等 1 秒后重新查找 dws 再试一次
-        import time as _time
-        _time.sleep(1)
-        dws_bin2 = _find_dws()
-        if os.path.isfile(dws_bin2):
-            log.warning(f"DWS 首次找不到 {dws_bin}，重试 {dws_bin2}")
-            cmd2 = _build_dws_cmd(dws_bin2, args)
-            try:
-                result = subprocess.run(cmd2, capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=120)
-            except FileNotFoundError:
-                log.error(f"DWS 重试仍失败: {dws_bin2}")
-                return {"success": False, "error": f"dws not found: {dws_bin2}"}
-        else:
-            log.error(f"DWS 执行失败: 找不到 {dws_bin}")
-            log.error("请确保已安装 dws CLI: npm install -g --allow-scripts=dingtalk-workspace-cli dingtalk-workspace-cli")
-            log.error("→ 若已安装仍找不到，用 --dws-path 指定完整路径")
+
+    # Windows: 直接用 shell=True，最稳定，不会被 cmd/node 路径间歇性问题影响
+    if sys.platform == "win32":
+        cmd_str = f"{dws_bin_quoted} {' '.join(args)}"
+        try:
+            result = subprocess.run(cmd_str, capture_output=True, text=True,
+                                    encoding='utf-8', errors='replace',
+                                    timeout=120, shell=True)
+        except FileNotFoundError:
+            log.error(f"DWS 执行失败: {dws_bin} (shell=True also failed)")
+            log.error("请确保 dws CLI 已正确安装: npm install -g --allow-scripts=dingtalk-workspace-cli dingtalk-workspace-cli")
             return {"success": False, "error": f"dws not found: {dws_bin}"}
-    except subprocess.TimeoutExpired:
-        log.error(f"DWS 命令超时 (>120s): {' '.join(args[:6])}")
-        return {"success": False, "error": "timeout"}
+        except subprocess.TimeoutExpired:
+            log.error(f"DWS 命令超时 (>120s): {' '.join(args[:6])}")
+            return {"success": False, "error": "timeout"}
+    else:
+        try:
+            result = subprocess.run([dws_bin] + args, capture_output=True,
+                                    text=True, timeout=120)
+        except FileNotFoundError:
+            log.error(f"DWS 执行失败: 找不到 {dws_bin}")
+            return {"success": False, "error": f"dws not found: {dws_bin}"}
+        except subprocess.TimeoutExpired:
+            log.error(f"DWS 命令超时 (>120s): {' '.join(args[:6])}")
+            return {"success": False, "error": "timeout"}
+
     if result.returncode != 0:
         log.warning(f"DWS 返回非零: {result.returncode}")
         log.warning(f"  stderr: {(result.stderr or '')[:500]}")
         log.debug(f"  stdout: {(result.stdout or '')[:500]}")
         return {"success": False, "error": (result.stderr or '')[:500]}
-    # stdout 为空或 None 时的防护
     if not result.stdout:
         log.warning(f"DWS 无输出 (returncode=0 但 stdout 为空)")
         log.warning(f"  stderr: {(result.stderr or '')[:500]}")
