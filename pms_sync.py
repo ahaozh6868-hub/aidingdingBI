@@ -432,11 +432,36 @@ def main():
 
     # ====== PARSE ARGS ======
     parser = argparse.ArgumentParser(description="PMS → AI表格同步")
-    parser.add_argument("--token", required=True, help="PMS Bearer token")
+    parser.add_argument("--token", default=None, help="PMS Bearer token")
     parser.add_argument("--full", action="store_true", help="全量同步（默认增量）")
     parser.add_argument("--dry-run", action="store_true", help="只检查不写入")
     parser.add_argument("--dws-path", default=None, help="dws CLI 可执行文件路径（默认从 PATH 查找）")
     args = parser.parse_args()
+
+    # Token 获取：参数 > 环境变量 PMS_TOKEN > 交互输入
+    if not args.token:
+        args.token = os.environ.get("PMS_TOKEN", "").strip()
+    if not args.token:
+        # 检查是否在交互式终端中
+        if sys.stdin.isatty():
+            print("=" * 60)
+            print("  PMS → 钉钉AI表格 同步工具")
+            print("=" * 60)
+            print()
+            print("  未提供 --token 参数。")
+            print("  请粘贴 PMS Bearer Token:")
+            print()
+            args.token = input("  Token: ").strip()
+            print()
+            if not args.token:
+                print("  [错误] Token 不能为空，程序退出。")
+                print("  用法: pms_sync.exe --token \"Bearer YOUR_TOKEN\"")
+                print()
+                sys.exit(1)
+        else:
+            print("错误: 必须提供 --token 参数")
+            print("用法: pms_sync.exe --token \"Bearer YOUR_TOKEN\"")
+            sys.exit(1)
 
     PMS_TOKEN = args.token
     if not PMS_TOKEN.startswith("Bearer "):

@@ -54,22 +54,35 @@ jobs:
           (
             echo @echo off
             echo chcp 65001 ^>nul
+            echo setlocal enabledelayedexpansion
             echo echo ============================================
-            echo echo   PMS 增量同步 - 拉取昨天数据到钉钉AI表格
+            echo echo   PMS Sync Tool
             echo echo ============================================
             echo echo.
-            echo echo 请粘贴 PMS Bearer Token 后按回车...
+            echo echo Paste your PMS Bearer Token and press Enter:
             echo echo.
             echo set /p TOKEN="Token: "
             echo echo.
-            echo echo 正在同步，请勿关闭此窗口...
+            echo echo Syncing, please wait...
             echo "%%~dp0pms_sync.exe" --token "!TOKEN!"
             echo echo.
-            echo echo 同步完成！
-            echo echo 日志文件: %%~dp0logs\
+            echo echo Done! Logs saved to: %%~dp0logs\
             echo echo.
             echo pause
           ) > release_pms_sync\一键运行.bat
+          (
+            echo @echo off
+            echo chcp 65001 ^>nul
+            echo echo ============================================
+            echo echo   PMS Sync Tool - Dry Run ^(no write^)
+            echo echo ============================================
+            echo echo.
+            echo set /p TOKEN="Token: "
+            echo echo.
+            echo "%%~dp0pms_sync.exe" --token "!TOKEN!" --dry-run
+            echo echo.
+            echo pause
+          ) > release_pms_sync\一键检查.bat
 
       - name: Upload EXE
         uses: actions/upload-artifact@v4
