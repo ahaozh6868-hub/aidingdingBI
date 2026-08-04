@@ -746,6 +746,8 @@ def main():
     if args.dws_path:
         _DWS_PATH = args.dws_path
 
+    mode = "全量" if args.full else mode_label
+
     # ====== 生命周期：启动 ======
     log.hr("=", 65)
     log.lifecycle(f"PMS → AI Table 同步启动 | 模式: {mode} | Dry-Run: {args.dry_run}")
