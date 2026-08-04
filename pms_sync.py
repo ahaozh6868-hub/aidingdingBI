@@ -231,7 +231,7 @@ def pms_get(path, params=None):
     try:
         with urllib.request.urlopen(req, timeout=30, context=_get_ssl_context()) as resp:
             raw = resp.read()
-            log.debug(f"GET {url} → HTTP {resp.status} ({len(raw)} bytes) body: {raw[:300].decode('utf-8', errors='replace')}")
+            log.debug(f"GET {url} → HTTP {resp.status} ({len(raw)} bytes)\n--- RESPONSE BODY ---\n{raw.decode('utf-8', errors='replace')}\n--- END ---")
             data = json.loads(raw)
             _check_pms_response(data, url)
             return data
@@ -252,7 +252,7 @@ def pms_post(path, body):
     try:
         with urllib.request.urlopen(req, timeout=30, context=_get_ssl_context()) as resp:
             raw = resp.read()
-            log.debug(f"POST {url} → HTTP {resp.status} ({len(raw)} bytes) body: {raw[:300].decode('utf-8', errors='replace')}")
+            log.debug(f"POST {url} → HTTP {resp.status} ({len(raw)} bytes)\n--- RESPONSE BODY ---\n{raw.decode('utf-8', errors='replace')}\n--- END ---")
             data = json.loads(raw)
             _check_pms_response(data, url)
             return data
@@ -277,13 +277,17 @@ def dws_cmd(args):
         log.error(f"DWS 命令超时 (>120s): {' '.join(args[:6])}")
         return {"success": False, "error": "timeout"}
     if result.returncode != 0:
-        log.warning(f"DWS 返回非零: {result.returncode}, stderr={result.stderr[:200]}")
-        return {"success": False, "error": result.stderr[:300]}
+        log.warning(f"DWS 返回非零: {result.returncode}")
+        log.warning(f"  stderr: {result.stderr[:500]}")
+        log.debug(f"  stdout: {result.stdout[:500]}")
+        return {"success": False, "error": result.stderr[:500]}
     try:
-        return json.loads(result.stdout)
+        parsed = json.loads(result.stdout)
+        log.debug(f"DWS 响应: {json.dumps(parsed, ensure_ascii=False)[:1000]}")
+        return parsed
     except json.JSONDecodeError:
-        log.warning(f"DWS 输出非 JSON: {result.stdout[:200]}")
-        return {"success": False, "error": result.stdout[:300]}
+        log.warning(f"DWS 输出非 JSON (len={len(result.stdout)}): {result.stdout[:500]}")
+        return {"success": False, "error": result.stdout[:500]}
 
 # ====== 去重查询（分页） ======
 def query_existing_ids(table_key, field_id):
@@ -564,7 +568,9 @@ def main():
     # ====== Stage 1: 物料表 ======
     try:
         log.stage_begin("物料表")
-        mats = pms_post("/pms/system/kc/material/list", {"current":1,"size":100,"baseId":BASE_ID_PMS}).get("rows",[])
+        mats_resp = pms_post("/pms/system/kc/material/list", {"current":1,"size":100,"baseId":BASE_ID_PMS})
+        log.debug(f"PMS 物料原始响应 keys: {list(mats_resp.keys())}, rows={len(mats_resp.get('rows',[]))}, total={mats_resp.get('total','N/A')}")
+        mats = mats_resp.get("rows",[])
         log.debug(f"PMS 返回物料: {len(mats)} 条")
         r = sync_table("material", MATERIAL_FIELDS, [transform_material(m) for m in mats], "num", args.dry_run)
         if r is None:
@@ -581,7 +587,9 @@ def main():
     # ====== Stage 2: 仓库表 ======
     try:
         log.stage_begin("仓库表")
-        whs = pms_get("/pms/system/warehouse/list", {"baseId":BASE_ID_PMS}).get("rows",[])
+        whs_resp = pms_get("/pms/system/warehouse/list", {"baseId":BASE_ID_PMS})
+        log.debug(f"PMS 仓库原始响应 keys: {list(whs_resp.keys())}, rows={len(whs_resp.get('rows',[]))}, total={whs_resp.get('total','N/A')}")
+        whs = whs_resp.get("rows",[])
         log.debug(f"PMS 返回仓库: {len(whs)} 条")
         r = sync_table("warehouse", WAREHOUSE_FIELDS, [transform_warehouse(w) for w in whs], "code", args.dry_run)
         if r is None:
@@ -601,6 +609,7 @@ def main():
     try:
         log.stage_begin("订单主表")
         orders_resp = pms_post("/pms/kc/order/list", {"current":1,"size":100,"baseId":BASE_ID_PMS})
+        log.debug(f"PMS 订单原始响应 keys: {list(orders_resp.keys())}, rows={len(orders_resp.get('rows',[]))}, total={orders_resp.get('total','N/A')}")
         orders = orders_resp.get("rows", [])
         log.debug(f"PMS 返回订单列表: {len(orders)} 条")
 
@@ -690,6 +699,7 @@ def main():
     try:
         log.stage_begin("库存变动记录")
         inv_resp = pms_get("/pms/system/inventory/find-records", {"current":1,"size":100,"baseId":BASE_ID_PMS})
+        log.debug(f"PMS 库存原始响应 keys: {list(inv_resp.keys())}, rows={len(inv_resp.get('rows',[]))}, total={inv_resp.get('total','N/A')}")
         inv_total = inv_resp.get("total", 0)
         inv_rows = inv_resp.get("rows", [])
         page = 2
