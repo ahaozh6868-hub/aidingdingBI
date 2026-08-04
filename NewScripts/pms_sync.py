@@ -683,7 +683,29 @@ def main():
     parser.add_argument("--full", action="store_true", help="全量同步（默认增量）")
     parser.add_argument("--dry-run", action="store_true", help="只检查不写入")
     parser.add_argument("--dws-path", default=None, help="dws CLI 可执行文件路径（默认从 PATH 查找）")
+    parser.add_argument("--date", default=None, help="指定同步日期 (YYYY-MM-DD)，默认最近3天")
+    parser.add_argument("--days", type=int, default=3, help="增量同步最近N天 (默认3)，与--date同时指定则只取那1天")
     args = parser.parse_args()
+
+    # ====== 目标日期计算 ======
+    today = datetime.date.today()
+    if args.date:
+        # 用户指定了具体日期
+        try:
+            target_date = datetime.datetime.strptime(args.date, "%Y-%m-%d").date()
+        except ValueError:
+            log.error(f"日期格式错误: {args.date}，应为 YYYY-MM-DD")
+            sys.exit(1)
+        if target_date > today:
+            log.error(f"目标日期 {target_date} 不能超过今天 {today}")
+            sys.exit(1)
+        target_days = [target_date.strftime("%Y-%m-%d")]
+        mode_label = f"增量(指定日期:{target_date})"
+    else:
+        # 默认：最近 N 天
+        args.days = max(1, args.days)
+        target_days = [(today - datetime.timedelta(days=i)).strftime("%Y-%m-%d") for i in range(1, args.days + 1)]
+        mode_label = f"增量(最近{args.days}天:{target_days[-1]}~{target_days[0]})"
 
     # Token 获取：参数 > 环境变量 PMS_TOKEN > 交互输入
     if not args.token:
@@ -724,15 +746,11 @@ def main():
     if args.dws_path:
         _DWS_PATH = args.dws_path
 
-    yesterday = (datetime.date.today() - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
-    # 增量容错：最近3天（昨天+前天+大前天），漏跑1-2天也能补回
-    recent_days = [(datetime.date.today() - datetime.timedelta(days=i)).strftime("%Y-%m-%d") for i in range(1, 4)]
-    mode = "全量" if args.full else f"增量(最近3天:{recent_days[-1]}~{recent_days[0]})"
-
     # ====== 生命周期：启动 ======
     log.hr("=", 65)
     log.lifecycle(f"PMS → AI Table 同步启动 | 模式: {mode} | Dry-Run: {args.dry_run}")
     log.info(f"  时间: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    log.info(f"  目标日期: {', '.join(target_days)}")
     log.info(f"  程序: {SCRIPT_DIR}")
     log.info(f"  dws:  {_find_dws()}")
     log.info(f"  PMS:  {PMS_BASE} (baseId={BASE_ID_PMS})")
@@ -830,8 +848,8 @@ def main():
             log.warning(f"订单详情获取: {fetch_errors}/{len(orders)} 失败")
 
         if not args.full:
-            recent_orders = [o for o in full_orders if (o.get("planDeliveryDate") or "") in recent_days]
-            log.info(f"  最近3天({recent_days[-1]}~{recent_days[0]})订单: {len(recent_orders)} 条")
+            recent_orders = [o for o in full_orders if (o.get("planDeliveryDate") or "") in target_days]
+            log.info(f"  目标日期({target_days[0]}{'~' + target_days[-1] if len(target_days) > 1 else ''})订单: {len(recent_orders)} 条")
             log.debug(f"待同步订单ID: {[o.get('orderId') for o in recent_orders]}")
 
             existing_orders = query_existing_ids("order_main", ORDER_FIELDS["orderId"])
@@ -900,19 +918,19 @@ def main():
         inv_all = pms_fetch_all_get("/pms/system/inventory/find-records", {"baseId":BASE_ID_PMS})
         log.debug(f"PMS 返回库存: {len(inv_all)} 条")
 
-        # 增量容错：保留最近3天的记录（operationTime 以 recent_days 任一日期开头）
-        recent_inv = [i for i in inv_all if any((i.get("operationTime") or "").startswith(d) for d in recent_days)]
-        log.info(f"  最近3天({recent_days[-1]}~{recent_days[0]})库存变动: {len(recent_inv)} 条 (总{len(inv_all)})")
+        # 按目标日期过滤库存记录
+        recent_inv = [i for i in inv_all if any((i.get("operationTime") or "").startswith(d) for d in target_days)]
+        log.info(f"  目标日期({target_days[0]}{'~' + target_days[-1] if len(target_days) > 1 else ''})库存变动: {len(recent_inv)} 条 (总{len(inv_all)})")
         if not recent_inv:
-            log.info("  库存变动: 最近3天无数据, 跳过")
-            results.append(("库存变动记录", {"skipped": True, "reason": "最近3天无数据"}))
+            log.info("  库存变动: 无目标日期数据, 跳过")
+            results.append(("库存变动记录", {"skipped": True, "reason": "无目标日期数据"}))
         else:
             r = sync_table("inventory", INVENTORY_FIELDS, [transform_inventory(i) for i in recent_inv], "recordNum", args.dry_run, skip_update=True)
             if r is None:
                 log.stage_end("库存变动记录", "跳过（无权限/认证失败）")
                 results.append(("库存变动记录", {"skipped": True, "reason": "dws权限不足"}))
             else:
-                log.stage_end("库存变动记录", f"{r['new']}新增/{r.get('skipped',r.get('updated',0))}跳过 (已有{r['existing']}) 近3天{len(recent_inv)}/总{len(inv_all)}条")
+                log.stage_end("库存变动记录", f"{r['new']}新增/{r.get('skipped',r.get('updated',0))}跳过 (已有{r['existing']}) 目标{len(recent_inv)}/总{len(inv_all)}条")
                 results.append(("库存变动记录", r))
     except Exception as e:
         log.exception(f"库存变动记录同步异常")
