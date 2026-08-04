@@ -644,33 +644,26 @@ def sync_table(table_key, fields, records, key_field, dry_run=False, full_mode=F
         result["dry_run"] = True
         return result
 
-    # dws 路径缓存一次 + 临时文件绕过命令行长度限制
+    # 固定 30 条/批：每条约 350 字符 UTF-8 ≈ 350 WCHAR，30*350+500=11000，远低于 32767
     _cached_dws = _find_dws()
+    BATCH = 30
 
     def _batch_write(action, items):
-        """JSON 写临时文件传路径，彻底绕开 Windows 32767 限制"""
         ok, fail = 0, 0
-        for i in range(0, len(items), 50):
-            batch = items[i:i+50]
+        for i in range(0, len(items), BATCH):
+            batch = items[i:i+BATCH]
             batch_json = json.dumps(batch, ensure_ascii=False)
-            tmp = os.path.join(SCRIPT_DIR, f"_pms_{action}.json")
-            with open(tmp, 'w', encoding='utf-8') as f:
-                f.write(batch_json)
             cmd = [_cached_dws, "aitable", "record", action,
                    "--base-id", AI_BASE_ID, "--table-id", AI_TABLES[table_key],
-                   "--records", tmp, "--format", "json"]
-            log.debug(f"DWS(file-{action}): {len(batch)} records ({len(batch_json)} bytes)")
-            result = None
+                   "--records", batch_json, "--format", "json"]
+            log.debug(f"DWS({action}): {len(batch)} records")
             try:
                 result = subprocess.run(cmd, capture_output=True, timeout=120)
             except subprocess.TimeoutExpired:
                 fail += len(batch)
                 log.warning(f"  [{table_key}] {action.upper()} 超时 ({len(batch)}条)")
-            finally:
-                try: os.unlink(tmp)
-                except: pass
-            if result is None:
                 continue
+
             def _dec(b):
                 if b is None: return ""
                 try: return b.decode('utf-8')
