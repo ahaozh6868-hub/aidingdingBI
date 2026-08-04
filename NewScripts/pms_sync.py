@@ -589,7 +589,7 @@ def transform_inventory(i):
         "qtyDesc": i.get("amountDesc") or "",
         "orderDetailId": i.get("orderDetailId") if i.get("orderDetailId") and i.get("orderDetailId")>0 else None,
         "deliveryDate": dd or None, "remark": i.get("remark") or "",
-        "status": i.get("status",0), "seqNum": i.get("id"),
+        "status": {0:"正常", -1:"废弃"}.get(i.get("status"), str(i.get("status",""))), "seqNum": i.get("id"),
     }
 
 # ====== 同步逻辑 ======
