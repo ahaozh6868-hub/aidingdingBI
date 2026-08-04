@@ -27,28 +27,28 @@ jobs:
           pip install pyinstaller certifi
 
       - name: 构建 exe（基于 NewScripts/）
-        shell: cmd
         run: |
           cd NewScripts
-          pyinstaller pms_sync.spec --clean --noconfirm
-          mkdir ..\release_pms_sync
-          copy dist\pms_sync.exe ..\release_pms_sync\
-          copy build_exe.bat ..\release_pms_sync\
-          (
-            echo PMS Sync Tool - User Guide
-            echo ==========================
-            echo.
-            echo 1. Install dws CLI:
-            echo    npm install -g --allow-scripts=dingtalk-workspace-cli dingtalk-workspace-cli
-            echo    then: dws auth login
-            echo.
-            echo 2. Run:
-            echo    pms_sync.exe --token "Bearer YOUR_TOKEN"
-            echo    pms_sync.exe --token "Bearer YOUR_TOKEN" --dry-run
-            echo    pms_sync.exe --token "Bearer YOUR_TOKEN" --full
-            echo.
-            echo 3. Logs auto-saved to: pms_sync.exe\logs\
-          ) > ..\release_pms_sync\README.txt
+          python -m PyInstaller pms_sync.spec --clean --noconfirm
+          if (-not (Test-Path dist\pms_sync.exe)) { throw "Build failed: dist\pms_sync.exe not found" }
+          New-Item -ItemType Directory -Force -Path ..\release_pms_sync | Out-Null
+          Copy-Item dist\pms_sync.exe ..\release_pms_sync\
+          Copy-Item build_exe.bat ..\release_pms_sync\
+          @"
+          PMS Sync Tool - User Guide
+          ==========================
+
+          1. Install dws CLI:
+             npm install -g --allow-scripts=dingtalk-workspace-cli dingtalk-workspace-cli
+             then: dws auth login
+
+          2. Run:
+             pms_sync.exe --token "Bearer YOUR_TOKEN"
+             pms_sync.exe --token "Bearer YOUR_TOKEN" --dry-run
+             pms_sync.exe --token "Bearer YOUR_TOKEN" --full
+
+          3. Logs auto-saved to: pms_sync.exe\logs\
+          "@ | Out-File -FilePath ..\release_pms_sync\README.txt -Encoding utf8
 
       - name: 上传 exe 产物
         uses: actions/upload-artifact@v4
