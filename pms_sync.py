@@ -211,6 +211,17 @@ def _get_ssl_context():
     _SSL_CONTEXT = ssl.create_default_context(cafile=certifi.where())
     return _SSL_CONTEXT
 
+def _check_pms_response(data, url):
+    """PMS API 有时返回 HTTP 200 但 body 里埋了错误码，需要检测"""
+    if isinstance(data, dict) and data.get("code") and data["code"] != 200:
+        code = data["code"]
+        msg = data.get("msg", str(data))
+        log.error(f"PMS 返回错误 [{url}]: code={code}, msg={msg[:200]}")
+        if code == 401:
+            log.error(f"  → Token 已失效或无权限，请更新 PMS token")
+        return False
+    return True
+
 def pms_get(path, params=None):
     url = PMS_BASE + path
     if params:
@@ -221,7 +232,9 @@ def pms_get(path, params=None):
         with urllib.request.urlopen(req, timeout=30, context=_get_ssl_context()) as resp:
             raw = resp.read()
             log.debug(f"GET {url} → HTTP {resp.status} ({len(raw)} bytes)")
-            return json.loads(raw)
+            data = json.loads(raw)
+            _check_pms_response(data, url)
+            return data
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", errors="replace")[:500] if e.fp else ""
         log.error(f"GET {url} → HTTP {e.code}: {body}")
@@ -240,7 +253,9 @@ def pms_post(path, body):
         with urllib.request.urlopen(req, timeout=30, context=_get_ssl_context()) as resp:
             raw = resp.read()
             log.debug(f"POST {url} → HTTP {resp.status} ({len(raw)} bytes)")
-            return json.loads(raw)
+            data = json.loads(raw)
+            _check_pms_response(data, url)
+            return data
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", errors="replace")[:500] if e.fp else ""
         log.error(f"POST {url} → HTTP {e.code}: {body}")
