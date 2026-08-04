@@ -644,36 +644,34 @@ def sync_table(table_key, fields, records, key_field, dry_run=False, full_mode=F
         result["dry_run"] = True
         return result
 
-    # 固定 30 条/批：每条约 350 字符 UTF-8 ≈ 350 WCHAR，30*350+500=11000，远低于 32767
+    # stdin管道：JSON 走 stdin 不占命令行，50条/批平衡效率
     _cached_dws = _find_dws()
-    BATCH = 30
 
     def _batch_write(action, items):
+        """JSON 走 stdin 管道，命令行仅 --records -，不受 32767 限制"""
         ok, fail = 0, 0
-        for i in range(0, len(items), BATCH):
-            batch = items[i:i+BATCH]
+        for i in range(0, len(items), 50):
+            batch = items[i:i+50]
             batch_json = json.dumps(batch, ensure_ascii=False)
             cmd = [_cached_dws, "aitable", "record", action,
                    "--base-id", AI_BASE_ID, "--table-id", AI_TABLES[table_key],
-                   "--records", batch_json, "--format", "json"]
-            log.debug(f"DWS({action}): {len(batch)} records")
+                   "--records", "-", "--format", "json"]
+            log.debug(f"DWS(stdin-{action}): {len(batch)} records")
             try:
-                result = subprocess.run(cmd, capture_output=True, timeout=120)
+                result = subprocess.run(cmd, input=batch_json.encode('utf-8'),
+                                        capture_output=True, timeout=120)
             except subprocess.TimeoutExpired:
                 fail += len(batch)
-                log.warning(f"  [{table_key}] {action.upper()} 超时 ({len(batch)}条)")
                 continue
-
             def _dec(b):
                 if b is None: return ""
                 try: return b.decode('utf-8')
                 except: return b.decode('gbk', errors='replace')
-            stdout, stderr = _dec(result.stdout), _dec(result.stderr)
             if result.returncode == 0:
                 ok += len(batch)
             else:
                 fail += len(batch)
-                log.warning(f"  [{table_key}] {action.upper()} 批次失败 ({len(batch)}条): {stderr[:150]}")
+                log.warning(f"  [{table_key}] {action.upper()} fail ({len(batch)}): {_dec(result.stderr)[:150]}")
         return ok, fail
 
     result["create_ok"], result["create_fail"] = _batch_write("create", to_create)
