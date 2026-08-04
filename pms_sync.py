@@ -169,16 +169,39 @@ _SSL_CONTEXT = None
 _DWS_PATH = "dws"  # 默认依赖 PATH, 可用 --dws-path 覆盖
 
 def _find_dws():
-    """查找 dws 可执行文件：指定路径 > 同级目录 dws.exe > PATH"""
+    """查找 dws 可执行文件：指定路径 > 同级目录 > npm全局目录 > PATH"""
+    # 1. 显式指定路径
     if _DWS_PATH and os.path.isfile(_DWS_PATH):
         return _DWS_PATH
-    # exe 同级目录查找 (PyInstaller 打包场景)
+
+    # 2. exe 同级目录查找 (PyInstaller 打包 / 手动放 dws.exe 过来)
     exe_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
-    for name in ["dws.exe", "dws"]:
+    for name in ["dws.exe", "dws", "dws.cmd"]:
         candidate = os.path.join(exe_dir, name)
         if os.path.isfile(candidate):
             return candidate
-    return _DWS_PATH  # 回退到 PATH 查找
+
+    # 3. Windows: 探测 npm 全局安装目录 (subprocess 可能没继承 PATH)
+    if sys.platform == "win32":
+        for base in [os.environ.get("APPDATA", ""), os.environ.get("LOCALAPPDATA", "")]:
+            for name in ["dws.cmd", "dws", "dws.exe"]:
+                candidate = os.path.join(base, "npm", name)
+                if os.path.isfile(candidate):
+                    return candidate
+        # npm prefix -g 的实际路径
+        try:
+            result = subprocess.run(["npm", "prefix", "-g"], capture_output=True, text=True, timeout=10)
+            if result.returncode == 0:
+                npm_prefix = result.stdout.strip()
+                for name in ["dws.cmd", "dws", "dws.exe"]:
+                    candidate = os.path.join(npm_prefix, name)
+                    if os.path.isfile(candidate):
+                        return candidate
+        except Exception:
+            pass
+
+    # 4. 回退到 PATH 查找 (subprocess 会自己找)
+    return _DWS_PATH
 
 def _get_ssl_context():
     """创建 SSL 上下文，使用 certifi 证书"""
