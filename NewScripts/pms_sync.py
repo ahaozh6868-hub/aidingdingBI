@@ -593,8 +593,9 @@ def transform_inventory(i):
     }
 
 # ====== 同步逻辑 ======
-def sync_table(table_key, fields, records, key_field, dry_run=False, full_mode=False):
+def sync_table(table_key, fields, records, key_field, dry_run=False, full_mode=False, skip_update=False):
     """同步单表：去重检查 + 新增/更新 + (full_mode时)删除PMS不存在的孤儿记录
+    skip_update=True: 已有记录直接跳过，不更新也不报错（用于库存等不可变数据）
     Returns None 表示因权限/认证问题无法操作，调用方应跳过
     """
     key_fid = fields[key_field]
@@ -607,13 +608,16 @@ def sync_table(table_key, fields, records, key_field, dry_run=False, full_mode=F
 
     # PMS 侧的去重 key 集合
     pms_keys = set()
-    to_create, to_update = [], []
+    to_create, to_update, skipped = [], [], 0
     for item in records:
         cells = {fid: item[k] for k, fid in fields.items() if item.get(k) is not None}
         kv = str(item.get(key_field, ""))
         pms_keys.add(kv)
         if kv in existing:
-            to_update.append({"recordId": existing[kv], "cells": cells})
+            if skip_update:
+                skipped += 1
+            else:
+                to_update.append({"recordId": existing[kv], "cells": cells})
         else:
             to_create.append({"cells": cells})
 
@@ -626,6 +630,7 @@ def sync_table(table_key, fields, records, key_field, dry_run=False, full_mode=F
 
     result = {"table": table_key, "existing": len(existing),
                "new": len(to_create), "updated": len(to_update),
+               "skipped": skipped if skip_update else 0,
                "deleted": len(to_delete),
                "create_ok": 0, "create_fail": 0,
                "update_ok": 0, "update_fail": 0,
@@ -902,12 +907,12 @@ def main():
             log.info("  库存变动: 最近3天无数据, 跳过")
             results.append(("库存变动记录", {"skipped": True, "reason": "最近3天无数据"}))
         else:
-            r = sync_table("inventory", INVENTORY_FIELDS, [transform_inventory(i) for i in recent_inv], "recordNum", args.dry_run)
+            r = sync_table("inventory", INVENTORY_FIELDS, [transform_inventory(i) for i in recent_inv], "recordNum", args.dry_run, skip_update=True)
             if r is None:
                 log.stage_end("库存变动记录", "跳过（无权限/认证失败）")
                 results.append(("库存变动记录", {"skipped": True, "reason": "dws权限不足"}))
             else:
-                log.stage_end("库存变动记录", f"{r['new']}新增/{r['updated']}更新 (已有{r['existing']}) 近3天{len(recent_inv)}/总{len(inv_all)}条")
+                log.stage_end("库存变动记录", f"{r['new']}新增/{r.get('skipped',r.get('updated',0))}跳过 (已有{r['existing']}) 近3天{len(recent_inv)}/总{len(inv_all)}条")
                 results.append(("库存变动记录", r))
     except Exception as e:
         log.exception(f"库存变动记录同步异常")
