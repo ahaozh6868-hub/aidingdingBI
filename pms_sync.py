@@ -519,8 +519,8 @@ def transform_inventory(i):
     }
 
 # ====== 同步逻辑 ======
-def sync_table(table_key, fields, records, key_field, dry_run=False):
-    """同步单表：去重检查 + 新增/更新
+def sync_table(table_key, fields, records, key_field, dry_run=False, full_mode=False):
+    """同步单表：去重检查 + 新增/更新 + (full_mode时)删除PMS不存在的孤儿记录
     Returns None 表示因权限/认证问题无法操作，调用方应跳过
     """
     key_fid = fields[key_field]
@@ -531,19 +531,31 @@ def sync_table(table_key, fields, records, key_field, dry_run=False):
         log.error(f"  → [{table_key}] 无法查询已有记录，跳过同步（防止重复写入）")
         return None
 
+    # PMS 侧的去重 key 集合
+    pms_keys = set()
     to_create, to_update = [], []
     for item in records:
         cells = {fid: item[k] for k, fid in fields.items() if item.get(k) is not None}
         kv = str(item.get(key_field, ""))
+        pms_keys.add(kv)
         if kv in existing:
             to_update.append({"recordId": existing[kv], "cells": cells})
         else:
             to_create.append({"cells": cells})
 
+    # 全量模式：找出 AI表格中有但 PMS 没有的孤儿记录，删除
+    to_delete = []
+    if full_mode:
+        for key, record_id in existing.items():
+            if key not in pms_keys:
+                to_delete.append(record_id)
+
     result = {"table": table_key, "existing": len(existing),
                "new": len(to_create), "updated": len(to_update),
+               "deleted": len(to_delete),
                "create_ok": 0, "create_fail": 0,
-               "update_ok": 0, "update_fail": 0}
+               "update_ok": 0, "update_fail": 0,
+               "delete_ok": 0, "delete_fail": 0}
     if dry_run:
         result["dry_run"] = True
         return result
@@ -569,6 +581,17 @@ def sync_table(table_key, fields, records, key_field, dry_run=False):
         else:
             result["update_fail"] += len(batch)
             log.warning(f"  [{table_key}] UPDATE 批次失败 ({len(batch)}条): {resp.get('error','')[:100]}")
+
+    # Delete orphans (batch 50, 防止URL过长)
+    for i in range(0, len(to_delete), 50):
+        batch = to_delete[i:i+50]
+        resp = dws_cmd(["aitable","record","delete","--base-id",AI_BASE_ID,"--table-id",AI_TABLES[table_key],
+                 "--record-ids", ",".join(batch), "--format","json"])
+        if resp.get("success"):
+            result["delete_ok"] += len(batch)
+        else:
+            result["delete_fail"] += len(batch)
+            log.warning(f"  [{table_key}] DELETE 批次失败 ({len(batch)}条): {resp.get('error','')[:100]}")
 
     return result
 
@@ -635,7 +658,7 @@ def main():
         log.stage_begin("物料表")
         mats = pms_fetch_all_post("/pms/system/kc/material/list", {"baseId":BASE_ID_PMS})
         log.debug(f"PMS 返回物料: {len(mats)} 条")
-        r = sync_table("material", MATERIAL_FIELDS, [transform_material(m) for m in mats], "num", args.dry_run)
+        r = sync_table("material", MATERIAL_FIELDS, [transform_material(m) for m in mats], "num", args.dry_run, full_mode=True)
         if r is None:
             log.stage_end("物料表", "跳过（无权限/认证失败）")
             results.append(("物料表", {"skipped": True, "reason": "dws权限不足"}))
@@ -652,7 +675,7 @@ def main():
         log.stage_begin("仓库表")
         whs = pms_fetch_all_get("/pms/system/warehouse/list", {"baseId":BASE_ID_PMS})
         log.debug(f"PMS 返回仓库: {len(whs)} 条")
-        r = sync_table("warehouse", WAREHOUSE_FIELDS, [transform_warehouse(w) for w in whs], "code", args.dry_run)
+        r = sync_table("warehouse", WAREHOUSE_FIELDS, [transform_warehouse(w) for w in whs], "code", args.dry_run, full_mode=True)
         if r is None:
             log.stage_end("仓库表", "跳过（无权限/认证失败）")
             results.append(("仓库表", {"skipped": True, "reason": "dws权限不足"}))
@@ -754,19 +777,26 @@ def main():
             results.append(("订单明细", {"error": str(e)}))
             aborted_stages.append("订单明细")
 
-    # ====== Stage 5: 库存变动记录 ======
+    # ====== Stage 5: 库存变动记录（增量：仅昨日） ======
     try:
         log.stage_begin("库存变动记录")
-        inv_rows = pms_fetch_all_get("/pms/system/inventory/find-records", {"baseId":BASE_ID_PMS})
-        log.debug(f"PMS 返回库存: {len(inv_rows)} 条")
+        inv_all = pms_fetch_all_get("/pms/system/inventory/find-records", {"baseId":BASE_ID_PMS})
+        log.debug(f"PMS 返回库存: {len(inv_all)} 条")
 
-        r = sync_table("inventory", INVENTORY_FIELDS, [transform_inventory(i) for i in inv_rows], "recordNum", args.dry_run)
-        if r is None:
-            log.stage_end("库存变动记录", "跳过（无权限/认证失败）")
-            results.append(("库存变动记录", {"skipped": True, "reason": "dws权限不足"}))
+        # 增量：只保留昨天的记录（operationTime 以 yesterday 开头）
+        yesterday_inv = [i for i in inv_all if (i.get("operationTime") or "").startswith(yesterday)]
+        log.info(f"  昨日({yesterday})库存变动: {len(yesterday_inv)} 条 (总{len(inv_all)})")
+        if not yesterday_inv:
+            log.info("  库存变动: 昨日无数据, 跳过")
+            results.append(("库存变动记录", {"skipped": True, "reason": "昨日无数据"}))
         else:
-            log.stage_end("库存变动记录", f"{r['new']}新增/{r['updated']}更新 (已有{r['existing']}) 总{len(inv_rows)}条")
-            results.append(("库存变动记录", r))
+            r = sync_table("inventory", INVENTORY_FIELDS, [transform_inventory(i) for i in yesterday_inv], "recordNum", args.dry_run)
+            if r is None:
+                log.stage_end("库存变动记录", "跳过（无权限/认证失败）")
+                results.append(("库存变动记录", {"skipped": True, "reason": "dws权限不足"}))
+            else:
+                log.stage_end("库存变动记录", f"{r['new']}新增/{r['updated']}更新 (已有{r['existing']}) 昨日{len(yesterday_inv)}/总{len(inv_all)}条")
+                results.append(("库存变动记录", r))
     except Exception as e:
         log.exception(f"库存变动记录同步异常")
         results.append(("库存变动记录", {"error": str(e)}))
