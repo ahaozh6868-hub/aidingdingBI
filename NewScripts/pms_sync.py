@@ -369,16 +369,12 @@ def pms_fetch_all_get(path, params, page_size=100):
         page += 1
     return rows
 
-def dws_cmd(args):
-    dws_bin = _find_dws()
-    log.debug(f"DWS: {dws_bin} {' '.join(args[:6])}...")
-    cmd = None
-    # Windows: 优先绕过 .cmd，直接用 node 执行 dws.js（避免 cmd /c 的 stdout 捕获/编码问题）
+def _build_dws_cmd(dws_bin, args):
+    """构建 dws 执行命令：Windows 优先直连 node 绕过 cmd /c"""
     if sys.platform == "win32" and dws_bin.lower().endswith(".cmd"):
         dws_dir = os.path.dirname(dws_bin)
         dws_js = os.path.join(dws_dir, "node_modules", "dingtalk-workspace-cli", "bin", "dws.js")
         if os.path.isfile(dws_js):
-            # 找 node：先查 dws.cmd 同目录，再 where node
             node_bin = None
             local_node = os.path.join(dws_dir, "node.exe")
             if os.path.isfile(local_node):
@@ -391,22 +387,37 @@ def dws_cmd(args):
                 except Exception:
                     pass
             if node_bin and os.path.isfile(node_bin):
-                cmd = [node_bin, dws_js] + args
                 log.debug(f"DWS(直连node): {node_bin} {dws_js}")
-    # 回退：用 cmd /c 执行 .cmd/.bat
-    if cmd is None:
-        if sys.platform == "win32" and dws_bin.lower().endswith((".cmd", ".bat")):
-            cmd = ["cmd", "/c", dws_bin] + args
-        else:
-            cmd = [dws_bin] + args
+                return [node_bin, dws_js] + args
+    # 回退
+    if sys.platform == "win32" and dws_bin.lower().endswith((".cmd", ".bat")):
+        return ["cmd", "/c", dws_bin] + args
+    return [dws_bin] + args
+
+def dws_cmd(args):
+    dws_bin = _find_dws()
+    log.debug(f"DWS: {dws_bin} {' '.join(args[:6])}...")
+    cmd = _build_dws_cmd(dws_bin, args)
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=120)
     except FileNotFoundError:
-        log.error(f"DWS 执行失败: 找不到 {dws_bin}")
-        log.error("请确保已安装 dws CLI: npm install -g --allow-scripts=dingtalk-workspace-cli dingtalk-workspace-cli")
-        log.error("→ 若已安装仍找不到，用 --dws-path 指定完整路径，如: --dws-path \"C:\\Users\\你的用户名\\AppData\\Roaming\\npm\\dws.cmd\"")
-        log.error("  (在终端运行 where dws 可获取 dws 的完整路径)")
-        return {"success": False, "error": f"dws not found: {dws_bin}"}
+        # 间歇性找不到文件：等 1 秒后重新查找 dws 再试一次
+        import time as _time
+        _time.sleep(1)
+        dws_bin2 = _find_dws()
+        if os.path.isfile(dws_bin2):
+            log.warning(f"DWS 首次找不到 {dws_bin}，重试 {dws_bin2}")
+            cmd2 = _build_dws_cmd(dws_bin2, args)
+            try:
+                result = subprocess.run(cmd2, capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=120)
+            except FileNotFoundError:
+                log.error(f"DWS 重试仍失败: {dws_bin2}")
+                return {"success": False, "error": f"dws not found: {dws_bin2}"}
+        else:
+            log.error(f"DWS 执行失败: 找不到 {dws_bin}")
+            log.error("请确保已安装 dws CLI: npm install -g --allow-scripts=dingtalk-workspace-cli dingtalk-workspace-cli")
+            log.error("→ 若已安装仍找不到，用 --dws-path 指定完整路径")
+            return {"success": False, "error": f"dws not found: {dws_bin}"}
     except subprocess.TimeoutExpired:
         log.error(f"DWS 命令超时 (>120s): {' '.join(args[:6])}")
         return {"success": False, "error": "timeout"}
@@ -927,7 +938,7 @@ def main():
             log.info("  库存变动: 无目标日期数据, 跳过")
             results.append(("库存变动记录", {"skipped": True, "reason": "无目标日期数据"}))
         else:
-            r = sync_table("inventory", INVENTORY_FIELDS, [transform_inventory(i) for i in recent_inv], "recordNum", args.dry_run, skip_update=True)
+            r = sync_table("inventory", INVENTORY_FIELDS, [transform_inventory(i) for i in recent_inv], "recordNum", args.dry_run, skip_update=not args.full)
             if r is None:
                 log.stage_end("库存变动记录", "跳过（无权限/认证失败）")
                 results.append(("库存变动记录", {"skipped": True, "reason": "dws权限不足"}))
