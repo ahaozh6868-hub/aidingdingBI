@@ -1,92 +1,65 @@
 name: Build Windows EXE
 
+# 触发条件：手动触发 + 推送 NewScripts 目录代码改动时自动打包
 on:
+  workflow_dispatch:          # 手动触发（GitHub 页面点 Run workflow）
   push:
+    branches: [ main, master ]
     paths:
-      - 'pms_sync.py'
-      - 'pms_sync.spec'
+      - 'NewScripts/**'
       - '.github/workflows/build.yml'
-  workflow_dispatch:   # 允许手动触发
 
 jobs:
   build:
-    runs-on: windows-latest
+    runs-on: windows-latest    # 云端 Windows 环境
     steps:
-      - uses: actions/checkout@v4
+      - name: 拉取代码
+        uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: 安装 Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: Install dependencies
-        run: pip install pyinstaller certifi
-
-      - name: Build EXE
-        run: pyinstaller pms_sync.spec --clean --noconfirm --log-level WARN
-
-      - name: Create release package
-        shell: cmd
+      - name: 安装打包依赖
         run: |
-          mkdir release_pms_sync
-          copy dist\pms_sync.exe release_pms_sync\
-          (
-            echo PMS同步工具 - 使用说明
-            echo ======================
-            echo.
-            echo 一、环境要求
-            echo   - Windows 7/10/11 (64位^)
-            echo   - 必须安装 dws CLI 工具
-            echo.
-            echo 二、安装 dws
-            echo   npm install -g --allow-scripts=dingtalk-workspace-cli dingtalk-workspace-cli
-            echo   或下载 dws.exe 放到 pms_sync.exe 同级目录
-            echo.
-            echo 三、运行（重要：不要在 C:\WINDOWS\system32 下运行！^)
-            echo   先 cd 到 exe 所在目录，然后:
-            echo   pms_sync.exe --token "Bearer TOKEN"         增量同步昨天
-            echo   pms_sync.exe --token "Bearer TOKEN" --dry-run  仅检查
-            echo   pms_sync.exe --token "Bearer TOKEN" --full   全量同步
-            echo.
-            echo 四、日志
-            echo   每次运行后自动在程序所在目录创建 logs\ 文件夹
-          ) > release_pms_sync\使用说明.txt
-          (
-            echo @echo off
-            echo chcp 65001 ^>nul
-            echo setlocal enabledelayedexpansion
-            echo echo ============================================
-            echo echo   PMS Sync Tool
-            echo echo ============================================
-            echo echo.
-            echo echo Paste your PMS Bearer Token and press Enter:
-            echo echo.
-            echo set /p TOKEN="Token: "
-            echo echo.
-            echo echo Syncing, please wait...
-            echo "%%~dp0pms_sync.exe" --token "!TOKEN!"
-            echo echo.
-            echo echo Done! Logs saved to: %%~dp0logs\
-            echo echo.
-            echo pause
-          ) > release_pms_sync\一键运行.bat
-          (
-            echo @echo off
-            echo chcp 65001 ^>nul
-            echo echo ============================================
-            echo echo   PMS Sync Tool - Dry Run ^(no write^)
-            echo echo ============================================
-            echo echo.
-            echo set /p TOKEN="Token: "
-            echo echo.
-            echo "%%~dp0pms_sync.exe" --token "!TOKEN!" --dry-run
-            echo echo.
-            echo pause
-          ) > release_pms_sync\一键检查.bat
+          python -m pip install --upgrade pip
+          pip install pyinstaller certifi
 
-      - name: Upload EXE
+      - name: 构建 exe（基于 NewScripts/）
+        run: |
+          cd NewScripts
+          pyinstaller pms_sync.spec --clean --noconfirm
+          mkdir ..\release_pms_sync
+          copy dist\pms_sync.exe ..\release_pms_sync\
+          copy build_exe.bat ..\release_pms_sync\
+          (
+            echo PMS Sync Tool - User Guide
+            echo ==========================
+            echo.
+            echo 1. Install dws CLI:
+            echo    npm install -g --allow-scripts=dingtalk-workspace-cli dingtalk-workspace-cli
+            echo    then: dws auth login
+            echo.
+            echo 2. Double-click "build_exe.bat" OR run:
+            echo    pms_sync.exe --token "Bearer YOUR_TOKEN"
+            echo    pms_sync.exe --token "Bearer YOUR_TOKEN" --dry-run
+            echo    pms_sync.exe --token "Bearer YOUR_TOKEN" --full
+            echo.
+            echo 3. Logs auto-saved to: pms_sync.exe\logs\
+          ) > ..\release_pms_sync\README.txt
+
+      - name: 上传 exe 产物
         uses: actions/upload-artifact@v4
         with:
           name: pms_sync_windows
           path: release_pms_sync/
-          retention-days: 30
+          if-no-files-found: error
+
+      # 打 tag (如 v1.0) 时额外创建 Release
+      - name: 创建 GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release_pms_sync/pms_sync.exe
+          generate_release_notes: true
