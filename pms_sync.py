@@ -266,13 +266,21 @@ def pms_post(path, body):
 
 # ====== 通用分页拉取 ======
 def pms_fetch_all_post(path, body, page_size=100):
-    """POST 分页拉取全部数据，自动翻页直到 rows 数量 >= total"""
+    """POST 分页拉取全部数据。
+    优先用 PMS 返回的 total，total=0 或不可信时按"本页未满则停止"兜底。"""
     body["current"] = 1
     body["size"] = page_size
     resp = pms_post(path, dict(body))
     total = resp.get("total", 0)
     rows = list(resp.get("rows", []))
-    log.debug(f"[分页POST] {path}: page=1, got={len(resp.get('rows',[]))}, total={total}")
+    first_got = len(resp.get("rows", []))
+    log.debug(f"[分页POST] {path}: page=1, got={first_got}, total={total}")
+
+    # 兜底：total 不可信时用 page_size 推断是否需要翻页
+    if total <= 0 and first_got >= page_size:
+        total = first_got + 1  # 强制进循环
+        log.debug(f"[分页POST] {path}: total={total} but got {first_got}, fallback to size-based pagination")
+
     page = 2
     while len(rows) < total:
         body["current"] = page
@@ -283,17 +291,28 @@ def pms_fetch_all_post(path, body, page_size=100):
             break
         rows.extend(new_rows)
         log.debug(f"[分页POST] {path}: page={page}, got={len(new_rows)}, accumulated={len(rows)}/{total}")
+        # 兜底：本页不满 page_size 且 total 不可信(人为值)，说明到最后一页了
+        if first_got >= page_size and len(new_rows) < page_size and total != resp.get("total", 0):
+            break
         page += 1
     return rows
 
 def pms_fetch_all_get(path, params, page_size=100):
-    """GET 分页拉取全部数据，自动翻页直到 rows 数量 >= total"""
+    """GET 分页拉取全部数据。
+    优先用 PMS 返回的 total，total=0 或不可信时按"本页未满则停止"兜底。"""
     params["current"] = 1
     params["size"] = page_size
     resp = pms_get(path, dict(params))
     total = resp.get("total", 0)
     rows = list(resp.get("rows", []))
-    log.debug(f"[分页GET] {path}: page=1, got={len(resp.get('rows',[]))}, total={total}")
+    first_got = len(resp.get("rows", []))
+    log.debug(f"[分页GET] {path}: page=1, got={first_got}, total={total}")
+
+    # 兜底：total 不可信时用 page_size 推断是否需要翻页
+    if total <= 0 and first_got >= page_size:
+        total = first_got + 1  # 强制进循环
+        log.debug(f"[分页GET] {path}: total={total} but got {first_got}, fallback to size-based pagination")
+
     page = 2
     while len(rows) < total:
         params["current"] = page
@@ -304,6 +323,9 @@ def pms_fetch_all_get(path, params, page_size=100):
             break
         rows.extend(new_rows)
         log.debug(f"[分页GET] {path}: page={page}, got={len(new_rows)}, accumulated={len(rows)}/{total}")
+        # 兜底：本页不满 page_size 且 total 不可信(人为值)，说明到最后一页了
+        if first_got >= page_size and len(new_rows) < page_size and total != resp.get("total", 0):
+            break
         page += 1
     return rows
 
