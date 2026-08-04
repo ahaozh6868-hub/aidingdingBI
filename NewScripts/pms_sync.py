@@ -644,34 +644,56 @@ def sync_table(table_key, fields, records, key_field, dry_run=False, full_mode=F
         result["dry_run"] = True
         return result
 
-    # Create/Update: JSON 通过 stdin 管道传入，避免 Windows 命令行长度限制
+    # Create/Update: dws 路径只找一次，Windows 命令行 ≤ 32767 字符
     BATCH_SIZE = 100
+    _cached_dws = _find_dws()
 
     def _batch_write(action, items, batch_size=BATCH_SIZE):
+        """批量写入：自动降批防止 Windows 命令行超长（32767字符限制）"""
         ok, fail = 0, 0
-        for i in range(0, len(items), batch_size):
-            batch = items[i:i+batch_size]
+        total = len(items)
+        idx = 0
+        while idx < total:
+            # 构建一个批次的 JSON，确保命令行总长 < 32000
+            batch = []
+            json_size = 0
+            while idx < total and json_size < 25000:  # 留 7000 给其他参数
+                item_json = json.dumps(items[idx], ensure_ascii=False)
+                comma = 1 if batch else 0
+                if json_size + len(item_json) + comma > 25000 and batch:
+                    break
+                batch.append(items[idx])
+                json_size += len(item_json) + comma
+                idx += 1
+            if not batch:
+                # 单条记录就超长，强制写入
+                batch = [items[idx]]
+                idx += 1
+
             batch_json = json.dumps(batch, ensure_ascii=False)
-            dws_bin = _find_dws()
-            log.debug(f"DWS(batch-{action}): {len(batch)} records, json={len(batch_json)} bytes")
+            cmd = [_cached_dws, "aitable", "record", action,
+                   "--base-id", AI_BASE_ID, "--table-id", AI_TABLES[table_key],
+                   "--records", batch_json, "--format", "json"]
+            log.debug(f"DWS(batch-{action}): {len(batch)} records ({json_size} bytes)")
+
             try:
-                result = _safe_run(
-                    [dws_bin, "aitable", "record", action,
-                     "--base-id", AI_BASE_ID, "--table-id", AI_TABLES[table_key],
-                     "--records", batch_json, "--format", "json"],
-                    timeout=120
-                )
-                if result.returncode == 0:
-                    ok += len(batch)
-                else:
-                    fail += len(batch)
-                    log.warning(f"  [{table_key}] {action.upper()} 批次失败 ({len(batch)}条): {(result.stderr or '')[:150]}")
-            except FileNotFoundError:
-                fail += len(batch)
-                log.warning(f"  [{table_key}] {action.upper()} 批次 dws 未找到 ({len(batch)}条)")
+                result = subprocess.run(cmd, capture_output=True, timeout=120)
             except subprocess.TimeoutExpired:
                 fail += len(batch)
+                idx += len(batch) if idx < total else 0
                 log.warning(f"  [{table_key}] {action.upper()} 超时 ({len(batch)}条)")
+                continue
+
+            def _dec(b):
+                if b is None: return ""
+                try: return b.decode('utf-8')
+                except: return b.decode('gbk', errors='replace')
+            stdout, stderr = _dec(result.stdout), _dec(result.stderr)
+            if result.returncode == 0:
+                ok += len(batch)
+            else:
+                fail += len(batch)
+                log.warning(f"  [{table_key}] {action.upper()} 批次失败 ({len(batch)}条): {stderr[:150]}")
         return ok, fail
 
     result["create_ok"], result["create_fail"] = _batch_write("create", to_create)
