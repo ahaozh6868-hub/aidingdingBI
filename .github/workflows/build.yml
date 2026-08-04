@@ -28,20 +28,21 @@ jobs:
 
       - name: 构建 exe
         run: |
-          pyinstaller --clean --noconfirm --distpath release_pms_sync --workpath build --specpath . NewScripts\pms_sync.spec
-          Move-Item -Force release_pms_sync\pms_sync\* release_pms_sync\
-          Remove-Item -Recurse -Force release_pms_sync\pms_sync -ErrorAction SilentlyContinue
-          New-Item -ItemType File -Path release_pms_sync\使用说明.txt -Force -Value @"
+          cd NewScripts
+          pyinstaller pms_sync.spec --clean --noconfirm
+          dir dist\
+          New-Item -ItemType Directory -Force -Path ..\release_pms_sync | Out-Null
+          Copy-Item dist\pms_sync.exe ..\release_pms_sync\
+          New-Item -ItemType File -Path ..\release_pms_sync\使用说明.txt -Force -Value @"
           PMS Sync Tool
           =============
-          1. Install dws: npm install -g --allow-scripts=dingtalk-workspace-cli dingtalk-workspace-cli
-             then: dws auth login
-          2. Run: pms_sync.exe --token "Bearer TOKEN"
-                  pms_sync.exe --token "Bearer TOKEN" --dry-run
-                  pms_sync.exe --token "Bearer TOKEN" --full
-          3. Logs: pms_sync.exe\logs\
+          1. npm install -g --allow-scripts=dingtalk-workspace-cli dingtalk-workspace-cli
+             dws auth login
+          2. pms_sync.exe --token "Bearer TOKEN"
+             pms_sync.exe --token "Bearer TOKEN" --dry-run
+             pms_sync.exe --token "Bearer TOKEN" --full
+          3. Logs: pms_sync.exe folder\logs\
           "@
-          Get-ChildItem release_pms_sync\ | ForEach-Object { $_.Name }
 
       - name: 上传 exe 产物
         uses: actions/upload-artifact@v4
