@@ -26,6 +26,39 @@ def _get_app_dir():
 
 SCRIPT_DIR = _get_app_dir()
 
+# ====== 通用 subprocess 安全执行（绕过 Windows _readerthread GBK 崩溃） ======
+def _safe_run(args, timeout=120, shell=False, check=False):
+    """
+    统一 subprocess 入口：二进制读写，手动 utf-8 解码。
+    Python subprocess 的 _readerthread 内建线程在 Windows 上默认用 GBK，
+    encoding='utf-8' 无法影响该线程，只能用二进制模式 + 手动解码。
+    """
+    try:
+        result = subprocess.run(args, capture_output=True, shell=shell,
+                                timeout=timeout, check=check)
+    except FileNotFoundError:
+        raise
+    except subprocess.TimeoutExpired:
+        raise
+    # 手动解码 stdout/stderr
+    def _decode(b):
+        if b is None:
+            return ""
+        try:
+            return b.decode('utf-8')
+        except UnicodeDecodeError:
+            return b.decode('gbk', errors='replace')
+    result.stdout = _decode(result.stdout)
+    result.stderr = _decode(result.stderr)
+    return result
+
+def _safe_run_t(args, timeout=10):
+    """轻量 _safe_run，默认10s超时，用于 where/npm prefix 等探测命令"""
+    try:
+        return _safe_run(args, timeout=timeout)
+    except Exception:
+        return None
+
 # ====== 日志系统 ======
 class DualLogger:
     """双通道日志：控制台 INFO 级别 + 文件 DEBUG 级别，带时间戳文件名"""
@@ -190,7 +223,7 @@ def _find_dws():
     # 3. Windows: 用 where 命令查找 PATH 里的 dws（最可靠，能找到终端里的 dws）
     if sys.platform == "win32":
         try:
-            result = subprocess.run(["where", "dws"], capture_output=True, text=True, timeout=10)
+            result = _safe_run_t(["where", "dws"])
             if result.returncode == 0:
                 lines = [l.strip() for l in result.stdout.strip().splitlines() if l.strip() and os.path.isfile(l.strip())]
                 # 优先选 .cmd/.exe/.bat，避免无扩展名的 shell 脚本（WinError 193）
@@ -229,7 +262,7 @@ def _find_dws():
                         return candidate
         # npm prefix -g 的实际路径
         try:
-            result = subprocess.run(["npm", "prefix", "-g"], capture_output=True, text=True, timeout=10)
+            result = _safe_run_t(["npm", "prefix", "-g"])
             if result.returncode == 0:
                 npm_prefix = result.stdout.strip()
                 for name in ["dws.cmd", "dws", "dws.exe"]:
@@ -374,8 +407,7 @@ def dws_cmd(args):
     dws_bin = _find_dws()
     log.debug(f"DWS: {dws_bin} {' '.join(args[:6])}...")
     try:
-        result = subprocess.run([dws_bin] + args, capture_output=True,
-                                text=True, encoding='utf-8', errors='replace', timeout=120)
+        result = _safe_run([dws_bin] + args)
     except FileNotFoundError:
         log.error(f"DWS 执行失败: 找不到 {dws_bin}")
         log.error("请确保 dws CLI 已正确安装: npm install -g --allow-scripts=dingtalk-workspace-cli dingtalk-workspace-cli")
@@ -623,12 +655,11 @@ def sync_table(table_key, fields, records, key_field, dry_run=False, full_mode=F
             dws_bin = _find_dws()
             log.debug(f"DWS(batch-{action}): {len(batch)} records, json={len(batch_json)} bytes")
             try:
-                result = subprocess.run(
+                result = _safe_run(
                     [dws_bin, "aitable", "record", action,
                      "--base-id", AI_BASE_ID, "--table-id", AI_TABLES[table_key],
                      "--records", batch_json, "--format", "json"],
-                    capture_output=True, text=True,
-                    encoding='utf-8', errors='replace', timeout=120
+                    timeout=120
                 )
                 if result.returncode == 0:
                     ok += len(batch)
