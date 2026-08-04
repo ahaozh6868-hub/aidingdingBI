@@ -657,7 +657,7 @@ def sync_table(table_key, fields, records, key_field, dry_run=False, full_mode=F
             with open(tmp, 'wb') as f:
                 f.write(batch_json.encode('utf-8'))
             # chcp 65001 + type 文件 | dws --records -
-            cmd = f'chcp 65001 >nul && type "{tmp}" | "{_cached_dws}" aitable record {action} --base-id {AI_BASE_ID} --table-id {AI_TABLES[table_key]} --records - --format json'
+            cmd = f'cmd /c "type "{tmp}" | "{_cached_dws}" aitable record {action} --base-id {AI_BASE_ID} --table-id {AI_TABLES[table_key]} --records - --format json"'
             log.debug(f"DWS(pipe-{action}): {len(batch)} records")
             result = None
             try:
