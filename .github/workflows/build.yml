@@ -33,15 +33,31 @@ jobs:
           if (-not (Test-Path dist\pms_sync.exe)) { throw "EXE not built" }
           New-Item -ItemType Directory -Force -Path ..\release | Out-Null
           Copy-Item dist\pms_sync.exe ..\release\
-          Set-Content -Path ..\release\README.txt -Value @"
-          PMS Sync Tool
-          =============
-          1. npm install -g --allow-scripts=dingtalk-workspace-cli dingtalk-workspace-cli
-             dws auth login
-          2. pms_sync.exe --token "Bearer TOKEN"
-             pms_sync.exe --token "Bearer TOKEN" --dry-run
-             pms_sync.exe --token "Bearer TOKEN" --full
-          3. Logs in: pms_sync.exe folder\logs\
+          Set-Content -Path ..\release\使用说明.txt -Value @"
+          PMS -> DingTalk AI Sync Tool
+          ============================
+
+          ENV PREP (first time only):
+            npm install -g --allow-scripts=dingtalk-workspace-cli dingtalk-workspace-cli
+            dws auth login
+
+          USAGE:
+            pms_sync.exe --token "Bearer TOKEN"                daily sync (last 3 days)
+            pms_sync.exe --token "Bearer TOKEN" --full          full sync all tables
+            pms_sync.exe --token "Bearer TOKEN" --date 2026-08-01   single date
+            pms_sync.exe --token "Bearer TOKEN" --days 7             last 7 days
+            pms_sync.exe --token "Bearer TOKEN" --dry-run            preview only
+            pms_sync.exe --token "Bearer TOKEN" --dws-path "D:\path\dws.cmd"
+
+          TABLE STRATEGY:
+            material / warehouse : full sync + orphan deletion (key: num / code)
+            order / detail       : target date / full sync (key: orderId / detailId)
+            inventory            : target date + skip update, --full for full update (key: recordNum)
+
+          PMS API: https://pms.cosmos-ag.com (baseId=152)
+          AI Table: vNG4YZ7Jnlp30gY2HNoGqLr9W2LD0oRE
+
+          Logs saved to: pms_sync.exe\logs\sync_YYYYMMDD_HHMMSS.log
           "@ -Encoding utf8
 
       - name: 上传 exe 产物
