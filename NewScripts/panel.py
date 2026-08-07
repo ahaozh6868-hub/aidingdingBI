@@ -1,4 +1,4 @@
-#\!/usr/bin/env python3
+#!/usr/bin/env python3
 """PMS Sync Panel - Native Desktop GUI (Tkinter, zero-dependency)"""
 import sys, os, json, subprocess, threading, datetime
 
