@@ -26,38 +26,53 @@ jobs:
           python -m pip install --upgrade pip
           pip install pyinstaller certifi
 
-      - name: 构建 exe
+      - name: 构建 pms_sync.exe
         run: |
           cd NewScripts
           pyinstaller --clean --noconfirm --onefile --console --name pms_sync --hidden-import certifi --hidden-import certifi.core --hidden-import ssl --hidden-import json --hidden-import argparse --hidden-import urllib --hidden-import urllib.request --hidden-import urllib.error --hidden-import urllib.parse --hidden-import subprocess --hidden-import datetime --hidden-import sys --hidden-import os --hidden-import logging --hidden-import logging.handlers --hidden-import traceback --hidden-import time --hidden-import io --collect-data certifi pms_sync.py
-          if (-not (Test-Path dist\pms_sync.exe)) { throw "EXE not built" }
-          New-Item -ItemType Directory -Force -Path ..\release | Out-Null
-          Copy-Item dist\pms_sync.exe ..\release\
-          Set-Content -Path ..\release\使用说明.txt -Value @"
-          PMS -> DingTalk AI Sync Tool
+          if (-not (Test-Path dist\pms_sync.exe)) { throw "pms_sync.exe not built" }
+
+      - name: 构建 panel.exe
+        run: |
+          cd NewScripts
+          pyinstaller panel.spec --clean --noconfirm
+          if (-not (Test-Path dist\pms_panel.exe)) { throw "panel.exe not built" }
+
+      - name: 打包发布
+        run: |
+          New-Item -ItemType Directory -Force -Path release | Out-Null
+          Copy-Item NewScripts\dist\pms_sync.exe release\
+          Copy-Item NewScripts\dist\pms_panel.exe release\
+          Set-Content -Path release\使用说明.txt -Value @"
+          PMS -> DingTalk AI 
           ============================
 
-          ENV PREP (first time only):
+          TWO EXEs:
+            pms_sync.exe   command-line sync tool
+            pms_panel.exe  visual sync panel (double-click to open)
+
+          PREP (first time):
             npm install -g --allow-scripts=dingtalk-workspace-cli dingtalk-workspace-cli
             dws auth login
 
-          USAGE:
-            pms_sync.exe --token "Bearer TOKEN"                daily sync (last 3 days)
-            pms_sync.exe --token "Bearer TOKEN" --full          full sync all tables
-            pms_sync.exe --token "Bearer TOKEN" --date 2026-08-01   single date
-            pms_sync.exe --token "Bearer TOKEN" --days 7             last 7 days
-            pms_sync.exe --token "Bearer TOKEN" --dry-run            preview only
-            pms_sync.exe --token "Bearer TOKEN" --dws-path "D:\path\dws.cmd"
+          PANEL USAGE:
+            Double-click pms_panel.exe, browser opens automatically
+            - Enter token -> choose mode -> click Start
+            - Supports: incremental / full / single date / date range / dry-run
+
+          CLI USAGE:
+            pms_sync.exe --token "Bearer TOKEN"                daily sync
+            pms_sync.exe --token "Bearer TOKEN" --full          full sync
+            pms_sync.exe --token "Bearer TOKEN" --date 2026-08-01
+            pms_sync.exe --token "Bearer TOKEN" --days 7
+            pms_sync.exe --token "Bearer TOKEN" --dry-run
 
           TABLE STRATEGY:
-            material / warehouse : full sync + orphan deletion (key: num / code)
-            order / detail       : target date / full sync (key: orderId / detailId)
-            inventory            : target date + skip update, --full for full update (key: recordNum)
+            material/warehouse: full sync + orphan delete (key: num/code)
+            order/detail:      target date / full sync (key: orderId/detailId)
+            inventory:         target date + skip, --full for update (key: recordNum)
 
-          PMS API: https://pms.cosmos-ag.com (baseId=152)
-          AI Table: vNG4YZ7Jnlp30gY2HNoGqLr9W2LD0oRE
-
-          Logs saved to: pms_sync.exe\logs\sync_YYYYMMDD_HHMMSS.log
+          Logs: pms_sync.exe\logs\  or  pms_panel.exe\logs\
           "@ -Encoding utf8
 
       - name: 上传 exe 产物
@@ -71,5 +86,5 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: release/pms_sync.exe
+          files: release/pms_sync.exe, release/pms_panel.exe
           generate_release_notes: true
