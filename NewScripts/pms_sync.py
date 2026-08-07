@@ -1025,53 +1025,69 @@ def main():
                 log.stage_end("库存表", f"预览: {len(stock_records)}条待写入 (已有{len(existing)}条将被清空)")
                 results.append(("库存表", {"new": len(stock_records), "deleted": len(existing), "dry_run": True}))
         else:
-            # 全量覆盖：删光 → 全量写
-            existing = query_existing_ids("inventory_stock", INVENTORY_STOCK_FIELDS["materialNum"])
-            if existing is None:
-                log.stage_end("库存表", "跳过（无权限）")
-                results.append(("库存表", {"skipped": True, "reason": "dws权限不足"}))
-            else:
-                deleted, del_fail = 0, 0
-                if existing:
-                    ids = list(existing.values())
-                    for i in range(0, len(ids), 50):
-                        batch = ids[i:i+50]
-                        resp = dws_cmd(["aitable","record","delete","--base-id",AI_BASE_ID,
-                                        "--table-id",AI_TABLES["inventory_stock"],
-                                        "--record-ids",",".join(batch),"--yes","--format","json"])
-                        if resp.get("success"):
-                            deleted += len(batch)
-                        else:
-                            del_fail += len(batch)
-                # 全量新增
-                created, create_fail = 0, 0
-                _cached_dws = _find_dws()
-                for i in range(0, len(stock_records), 10):
-                    batch = stock_records[i:i+10]
-                    batch_json = json.dumps([{"cells": {INVENTORY_STOCK_FIELDS[k]: v
-                        for k, v in r.items() if k != "batchMaterial" and r.get(k)}
-                    } for r in batch], ensure_ascii=False)
-                    cmd = [_cached_dws, "aitable", "record", "create",
-                           "--base-id", AI_BASE_ID, "--table-id", AI_TABLES["inventory_stock"],
-                           "--records", batch_json, "--format", "json"]
-                    try:
-                        result = subprocess.run(cmd, capture_output=True, timeout=120)
-                        def _d(b):
-                            if b is None: return ""
-                            try: return b.decode('utf-8')
-                            except: return b.decode('gbk', errors='replace')
-                        if result.returncode == 0:
-                            created += len(batch)
-                        else:
-                            create_fail += len(batch)
-                    except Exception:
-                        create_fail += len(batch)
+            # 全量覆盖：查全部 recordId（不用 query_existing_ids，避免同key覆盖）
+            all_ids = []
+            cursor = None
+            while True:
+                args = ["aitable","record","query","--base-id",AI_BASE_ID,
+                        "--table-id",AI_TABLES["inventory_stock"],"--format","json"]
+                if cursor: args.extend(["--cursor", cursor])
+                resp = dws_cmd(args)
+                if not resp.get("success"):
+                    break
+                data = resp.get("data", {})
+                for rec in data.get("records", []):
+                    if rec.get("recordId"):
+                        all_ids.append(rec["recordId"])
+                cursor = data.get("nextCursor")
+                if not cursor: break
 
-                r = {"existing": len(existing), "new": created, "deleted": deleted,
-                     "create_ok": created, "create_fail": create_fail,
-                     "delete_ok": deleted, "delete_fail": del_fail}
-                log.stage_end("库存表", f"{created}新增/{deleted}删除 (原{len(existing)}条)")
-                results.append(("库存表", r))
+            if not all_ids:
+                log.stage_end("库存表", "无数据")
+                results.append(("库存表", {"skipped": True, "reason": "无数据"}))
+            else:
+                # 删除全部已有记录
+                deleted, del_fail = 0, 0
+            for i in range(0, len(all_ids), 50):
+                batch = all_ids[i:i+50]
+                resp = dws_cmd(["aitable","record","delete","--base-id",AI_BASE_ID,
+                                "--table-id",AI_TABLES["inventory_stock"],
+                                "--record-ids",",".join(batch),"--yes","--format","json"])
+                if resp.get("success"):
+                    deleted += len(batch)
+                else:
+                    del_fail += len(batch)
+
+            existing_count = len(all_ids)
+            # 全量新增
+            created, create_fail = 0, 0
+            _cached_dws = _find_dws()
+            for i in range(0, len(stock_records), 10):
+                batch = stock_records[i:i+10]
+                batch_json = json.dumps([{"cells": {INVENTORY_STOCK_FIELDS[k]: v
+                    for k, v in r.items() if k != "batchMaterial" and r.get(k)}
+                } for r in batch], ensure_ascii=False)
+                cmd = [_cached_dws, "aitable", "record", "create",
+                       "--base-id", AI_BASE_ID, "--table-id", AI_TABLES["inventory_stock"],
+                       "--records", batch_json, "--format", "json"]
+                try:
+                    result = subprocess.run(cmd, capture_output=True, timeout=120)
+                    def _d(b):
+                        if b is None: return ""
+                        try: return b.decode('utf-8')
+                        except: return b.decode('gbk', errors='replace')
+                    if result.returncode == 0:
+                        created += len(batch)
+                    else:
+                        create_fail += len(batch)
+                except Exception:
+                    create_fail += len(batch)
+
+            r = {"existing": existing_count, "new": created, "deleted": deleted,
+                 "create_ok": created, "create_fail": create_fail,
+                 "delete_ok": deleted, "delete_fail": del_fail}
+            log.stage_end("库存表", f"{created}新增/{deleted}删除 (原{existing_count}条)")
+            results.append(("库存表", r))
     except Exception as e:
         log.exception(f"库存表同步异常")
         results.append(("库存表", {"error": str(e)}))
