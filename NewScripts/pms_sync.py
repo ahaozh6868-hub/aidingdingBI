@@ -152,6 +152,7 @@ AI_TABLES = {
     "material": "QJwb6MT",
     "warehouse": "sTwFnIX",
     "inventory": "wOSrNZM",
+    "inventory_stock": "haQArnf",
 }
 
 # Field mappings (same as v1)
@@ -201,6 +202,18 @@ INVENTORY_FIELDS = {
     "orderDetailId": "fyobumg6qllymcn65c4qd", "deliveryDate": "gzshsh7e6me59u9oxhgxg",
     "remark": "pkvrixpj38tox0qe6rjrm", "status": "1l0n513nq5iyxnsnrwe3v",
     "seqNum": "hbw80w8k0vkjh34npta6j",
+}
+
+# 库存表（快照）- 字段仅含 AI 表格实际存在的
+INVENTORY_STOCK_FIELDS = {
+    "warehouseName": "xgbb6qexp5j4af0d6ub6a",
+    "code": "6wsnbh5a1b9ui24pdfmgp",
+    "invBatch": "5eesu1gka1hsrrmf1wl3e",
+    "materialName": "5c3rhxkn1ti9qztdsilg2",
+    "materialNum": "0x7yp1nvxodwgqsijffon",
+    "amountDesc": "kszqixul5usj4a70d4103",
+    "unit": "pcus97hr4gj9yfuvkk467",
+    "batchMaterial": "5eesu1gka1hsrrmf1wl3e",  # 复用 invBatch fieldId，去重用
 }
 
 # ====== HTTP 工具 ======
@@ -597,6 +610,41 @@ def transform_inventory(i):
         "status": {0:"正常", -1:"废弃"}.get(i.get("status"), str(i.get("status",""))), "seqNum": i.get("id"),
     }
 
+def transform_inventory_stock(i):
+    """库存快照 /inventory/list → AI 表格字段"""
+    return {
+        "warehouseName": i.get("warehouseName") or "",
+        "code": i.get("code") or "",
+        "invBatch": i.get("invBatch") or "",
+        "materialName": i.get("materialName") or "",
+        "materialNum": i.get("materialNum") or "",
+        "amountDesc": i.get("amountDesc") or "",
+        "unit": i.get("unit") or "",
+        # 合成去重 key：批次 + 物料编号
+        "batchMaterial": f"{i.get('invBatch','')}||{i.get('materialNum','')}",
+    }
+
+# ====== 通用分页拉取 (pageNum 格式) ======
+def pms_fetch_all_get_pagenum(path, params, page_size=50):
+    """GET 分页 (pageNum/pageSize 格式，/inventory/list 专用)"""
+    params["pageNum"] = 1; params["pageSize"] = page_size
+    resp = pms_get(path, dict(params))
+    total = resp.get("total", 0)
+    rows = list(resp.get("rows", []))
+    log.debug(f"[分页GET-pn] {path}: page=1, got={len(rows)}, total={total}")
+    page = 2
+    while len(rows) < total:
+        params["pageNum"] = page
+        resp = pms_get(path, dict(params))
+        new_rows = resp.get("rows", [])
+        if not new_rows:
+            log.warning(f"[分页GET-pn] {path}: 第{page}页返回空, 停止")
+            break
+        rows.extend(new_rows)
+        log.debug(f"[分页GET-pn] {path}: page={page}, got={len(new_rows)}, accumulated={len(rows)}/{total}")
+        page += 1
+    return rows
+
 # ====== 同步逻辑 ======
 def sync_table(table_key, fields, records, key_field, dry_run=False, full_mode=False, skip_update=False):
     """同步单表：去重检查 + 新增/更新 + (full_mode时)删除PMS不存在的孤儿记录
@@ -766,7 +814,8 @@ def main():
     log.hr("=", 65)
     log.lifecycle(f"PMS → AI Table 同步启动 | 模式: {mode} | Dry-Run: {args.dry_run}")
     log.info(f"  时间: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    log.info(f"  目标日期: {', '.join(target_days)}")
+    if not args.full:
+        log.info(f"  目标日期: {', '.join(target_days)}")
     log.info(f"  程序: {SCRIPT_DIR}")
     log.info(f"  dws:  {_find_dws()}")
     log.info(f"  PMS:  {PMS_BASE} (baseId={BASE_ID_PMS})")
@@ -958,6 +1007,75 @@ def main():
         log.exception(f"库存变动记录同步异常")
         results.append(("库存变动记录", {"error": str(e)}))
         aborted_stages.append("库存变动记录")
+
+    # ====== Stage 6: 库存表（全量快照，删光重建，不受日期影响） ======
+    try:
+        log.stage_begin("库存表")
+        stocks = pms_fetch_all_get_pagenum("/pms/system/inventory/list", {"baseId":BASE_ID_PMS})
+        log.debug(f"PMS 返回库存: {len(stocks)} 条")
+        stock_records = [transform_inventory_stock(s) for s in stocks]
+
+        if args.dry_run:
+            # 仅预览
+            existing = query_existing_ids("inventory_stock", INVENTORY_STOCK_FIELDS["materialNum"])
+            if existing is None:
+                log.stage_end("库存表", "跳过（无权限）")
+                results.append(("库存表", {"skipped": True, "reason": "dws权限不足"}))
+            else:
+                log.stage_end("库存表", f"预览: {len(stock_records)}条待写入 (已有{len(existing)}条将被清空)")
+                results.append(("库存表", {"new": len(stock_records), "deleted": len(existing), "dry_run": True}))
+        else:
+            # 全量覆盖：删光 → 全量写
+            existing = query_existing_ids("inventory_stock", INVENTORY_STOCK_FIELDS["materialNum"])
+            if existing is None:
+                log.stage_end("库存表", "跳过（无权限）")
+                results.append(("库存表", {"skipped": True, "reason": "dws权限不足"}))
+            else:
+                deleted, del_fail = 0, 0
+                if existing:
+                    ids = list(existing.values())
+                    for i in range(0, len(ids), 50):
+                        batch = ids[i:i+50]
+                        resp = dws_cmd(["aitable","record","delete","--base-id",AI_BASE_ID,
+                                        "--table-id",AI_TABLES["inventory_stock"],
+                                        "--record-ids",",".join(batch),"--yes","--format","json"])
+                        if resp.get("success"):
+                            deleted += len(batch)
+                        else:
+                            del_fail += len(batch)
+                # 全量新增
+                created, create_fail = 0, 0
+                _cached_dws = _find_dws()
+                for i in range(0, len(stock_records), 10):
+                    batch = stock_records[i:i+10]
+                    batch_json = json.dumps([{"cells": {INVENTORY_STOCK_FIELDS[k]: v
+                        for k, v in r.items() if k != "batchMaterial" and r.get(k)}
+                    } for r in batch], ensure_ascii=False)
+                    cmd = [_cached_dws, "aitable", "record", "create",
+                           "--base-id", AI_BASE_ID, "--table-id", AI_TABLES["inventory_stock"],
+                           "--records", batch_json, "--format", "json"]
+                    try:
+                        result = subprocess.run(cmd, capture_output=True, timeout=120)
+                        def _d(b):
+                            if b is None: return ""
+                            try: return b.decode('utf-8')
+                            except: return b.decode('gbk', errors='replace')
+                        if result.returncode == 0:
+                            created += len(batch)
+                        else:
+                            create_fail += len(batch)
+                    except Exception:
+                        create_fail += len(batch)
+
+                r = {"existing": len(existing), "new": created, "deleted": deleted,
+                     "create_ok": created, "create_fail": create_fail,
+                     "delete_ok": deleted, "delete_fail": del_fail}
+                log.stage_end("库存表", f"{created}新增/{deleted}删除 (原{len(existing)}条)")
+                results.append(("库存表", r))
+    except Exception as e:
+        log.exception(f"库存表同步异常")
+        results.append(("库存表", {"error": str(e)}))
+        aborted_stages.append("库存表")
 
     # ====== 生命周期：汇总 ======
     log.lifecycle("同步结束，生成汇总...")
