@@ -82,7 +82,12 @@ class PanelApp:
         if not tk_:messagebox.showwarning("Token","Please enter PMS Bearer token.");return
         if not tk_.lower().startswith('bearer '):tk_='Bearer '+tk_
         mo=self.mv.get();dr=self.dr.get()
-        cmd=[sys.executable,SYNC_SCRIPT,'--token',tk_]
+        # PyInstaller exe: 同目录找 pms_sync.exe；开发环境用 python
+        if getattr(sys,'frozen',False):
+            sync_exe = os.path.join(SCRIPT_DIR,'pms_sync.exe')
+            cmd = [sync_exe,'--token',tk_]
+        else:
+            cmd = [sys.executable,SYNC_SCRIPT,'--token',tk_]
         if mo=='full':cmd.append('--full')
         elif mo=='date':cmd.extend(['--date',self.dv_date.get(),'--days','1'])
         elif mo=='range':
