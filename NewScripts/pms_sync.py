@@ -1029,10 +1029,10 @@ def main():
             all_ids = []
             cursor = None
             while True:
-                args = ["aitable","record","query","--base-id",AI_BASE_ID,
+                qargs = ["aitable","record","query","--base-id",AI_BASE_ID,
                         "--table-id",AI_TABLES["inventory_stock"],"--format","json"]
-                if cursor: args.extend(["--cursor", cursor])
-                resp = dws_cmd(args)
+                if cursor: qargs.extend(["--cursor", cursor])
+                resp = dws_cmd(qargs)
                 if not resp.get("success"):
                     break
                 data = resp.get("data", {})
