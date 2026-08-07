@@ -32,10 +32,10 @@ jobs:
           pyinstaller --clean --noconfirm --onefile --console --name pms_sync --hidden-import certifi --hidden-import certifi.core --hidden-import ssl --hidden-import json --hidden-import argparse --hidden-import urllib --hidden-import urllib.request --hidden-import urllib.error --hidden-import urllib.parse --hidden-import subprocess --hidden-import datetime --hidden-import sys --hidden-import os --hidden-import logging --hidden-import logging.handlers --hidden-import traceback --hidden-import time --hidden-import io --collect-data certifi pms_sync.py
           if (-not (Test-Path dist\pms_sync.exe)) { throw "pms_sync.exe not built" }
 
-      - name: 构建 panel.exe
+      - name:   panel.exe
         run: |
           cd NewScripts
-          pyinstaller panel.spec --clean --noconfirm
+          pyinstaller --clean --noconfirm --onefile --windowed --name pms_panel --hidden-import certifi --hidden-import certifi.core --hidden-import ssl --hidden-import json --hidden-import argparse --hidden-import urllib --hidden-import urllib.request --hidden-import urllib.error --hidden-import urllib.parse --hidden-import subprocess --hidden-import datetime --hidden-import sys --hidden-import os --hidden-import logging --hidden-import logging.handlers --hidden-import traceback --hidden-import time --hidden-import io --hidden-import tkinter --hidden-import tkinter.ttk --hidden-import tkinter.scrolledtext --hidden-import threading --add-data "pms_sync.py;." --collect-data certifi panel.py
           if (-not (Test-Path dist\pms_panel.exe)) { throw "panel.exe not built" }
 
       - name: 打包发布
