@@ -913,7 +913,7 @@ def main():
             log.warning(f"订单详情获取: {fetch_errors}/{len(orders)} 失败")
 
         if not args.full:
-            recent_orders = [o for o in full_orders if (o.get("planDeliveryDate") or "") in target_days]
+            recent_orders = [o for o in full_orders if (o.get("latestDeliveryDate") or "") in target_days]
             log.info(f"  目标日期({target_days[0]}{'~' + target_days[-1] if len(target_days) > 1 else ''})订单: {len(recent_orders)} 条")
             log.debug(f"待同步订单ID: {[o.get('orderId') for o in recent_orders]}")
 
